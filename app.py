@@ -50,6 +50,10 @@ def ensure_pandoc():
 
 ensure_pandoc()
 
+def xpath_omml(el, names: list[str]):
+    cond = " or ".join([f"local-name()='{n}'" for n in names])
+    return el.xpath(f".//*[{cond}]")
+
 
 # =========================
 # 1) Prompts
@@ -347,7 +351,7 @@ def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]],
     for p in all_ps:
         p_elm = p._p  # lxml element
         # math nodes can be m:oMath or m:oMathPara
-        nodes = p_elm.xpath(".//m:oMath | .//m:oMathPara", namespaces=NS)
+        nodes = p_elm.xpath(".//*[local-name()='oMath' or local-name()='oMathPara']")
         # We will replace each node in the paragraph in document order.
         for node in nodes:
             if seq_idx >= len(math_seq):
