@@ -1,5 +1,5 @@
-streamlit==1.41.1
-google-generativeai
+streamlit
+google-generativeai>=0.7.2
 matplotlib
 python-docx
 Pillow
