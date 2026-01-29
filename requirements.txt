@@ -1,5 +1,5 @@
-streamlit
-google-generativeai>=0.7.2
-matplotlib
-python-docx
-Pillow
+streamlit>=1.31
+google-genai>=1.0.0
+Pillow>=10.0
+markdown>=3.5
+bleach>=6.1
