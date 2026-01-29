@@ -483,13 +483,9 @@ def gemini_translate_items(
     src_lang: str,
     dst_lang: str,
 ) -> Dict[str, List[str]]:
-    """
-    items: [{"id":"p1","segments":[...]}]
-    return mapping id -> translated segments
-    """
     prompt = (TRANSLATE_PROMPT_TEMPLATE
-          .replace("__SRC_LANG__", src_lang)
-          .replace("__DST_LANG__", dst_lang))
+              .replace("__SRC_LANG__", src_lang)
+              .replace("__DST_LANG__", dst_lang))
 
     payload = {"items": items}
 
@@ -499,27 +495,26 @@ def gemini_translate_items(
     )
     res = safe_generate(client, model, [prompt, json.dumps(payload, ensure_ascii=False)], cfg)
 
-if res.error_message:
-    st.error(f"Gemini translate error\nstatus={res.status_code}\n\n{res.error_message}")
+    if res.error_message:
+        st.error(f"Gemini translate error\nstatus={res.status_code}\n\n{res.error_message}")
 
-    # 给出一条“能直接行动”的建议
-    if res.status_code == 429 and ("PerDayPerProjectPerModel-FreeTier" in res.error_message
-                                   or "generate_content_free_tier_requests" in res.error_message):
-        st.warning(
-            "这是 Free Tier 的“每日请求数”配额用完了（不是临时限流）。\n"
-            "解决：1) 换一个模型（每个模型单独计数） 2) 换项目/API Key 3) 开通 Billing 4) 等到配额刷新。"
-        )
-    elif res.status_code == 429:
-        st.info("这是临时限流/配额，程序会自动等待重试；若仍失败，请降低切片数量或增大翻译批次以减少请求次数。")
+        if res.status_code == 429 and ("PerDayPerProjectPerModel-FreeTier" in res.error_message
+                                       or "generate_content_free_tier_requests" in res.error_message):
+            st.warning(
+                "这是 Free Tier 的“每日请求数”配额用完了（不是临时限流）。\n"
+                "解决：1) 换模型（每个模型单独计数） 2) 换项目/API Key 3) 开通 Billing 4) 等到配额刷新。"
+            )
+        elif res.status_code == 429:
+            st.info("这是临时限流/配额，程序会自动等待重试；若仍失败，请降低切片数量或增大翻译批次以减少请求次数。")
 
-    st.stop()
-
+        st.stop()
 
     obj = extract_json_object(res.text)
     out: Dict[str, List[str]] = {}
     for it in obj.get("items", []):
         out[it["id"]] = it["segments"]
     return out
+
 
 def translate_docx_in_place(
     doc: Document,
