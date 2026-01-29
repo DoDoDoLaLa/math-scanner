@@ -71,17 +71,17 @@ OCR_PROMPT_ZH = r"""
 """.strip()
 
 TRANSLATE_PROMPT_TEMPLATE = r"""
-你是一个专业学术翻译引擎。请把以下内容从 {src_lang} 翻译到 {dst_lang}。
+你是一个专业学术翻译引擎。请把以下内容从 __SRC_LANG__ 翻译到 __DST_LANG__。
 
 严格要求：
 - 输入是 JSON，包含 items 列表，每个 item 有 id 和 segments（字符串列表）。
-- 输出必须是 JSON，结构必须为：{{"items":[{{"id":"...","segments":[...]}}, ...]}}
+- 输出必须是 JSON，结构必须为：{"items":[{"id":"...","segments":[...]}, ...]}
 - segments 的数量必须与输入完全一致；每个 segments[i] 对应翻译输入 segments[i]。
-- 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{
-  }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
+- 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{ }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
 - LaTeX 代码、公式环境（如 \begin{equation}...\end{equation} 或 $...$）不得改动。
 - 不要添加多余字段、不要输出解释、不要 Markdown。
 """.strip()
+
 
 
 # =========================
@@ -434,7 +434,10 @@ def gemini_translate_items(
     items: [{"id":"p1","segments":[...]}]
     return mapping id -> translated segments
     """
-    prompt = TRANSLATE_PROMPT_TEMPLATE.format(src_lang=src_lang, dst_lang=dst_lang)
+    prompt = (TRANSLATE_PROMPT_TEMPLATE
+          .replace("__SRC_LANG__", src_lang)
+          .replace("__DST_LANG__", dst_lang))
+
     payload = {"items": items}
 
     cfg = types.GenerateContentConfig(
