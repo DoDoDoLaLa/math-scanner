@@ -38,15 +38,6 @@ OCR_PROMPT_ZH = """你是一个用于学术文档的 OCR 引擎。
 """
 
 
-def guess_mime(filename: str) -> str:
-    fn = (filename or "").lower()
-    if fn.endswith(".png"):
-        return "image/png"
-    if fn.endswith(".webp"):
-        return "image/webp"
-    return "image/jpeg"
-
-
 @st.cache_data(show_spinner=False)
 def gemini_ocr_one(image_bytes: bytes, mime_type: str, model_id: str) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY")
@@ -73,8 +64,6 @@ def gemini_ocr_one(image_bytes: bytes, mime_type: str, model_id: str) -> str:
 
 # -----------------------------
 # Preprocess Markdown for better docx conversion
-# - normalize \(...\), \[...\] to $...$, $$...$$
-# - optional: convert \tag{1} to right-side text if needed
 # -----------------------------
 def normalize_math_delimiters(md: str) -> str:
     md = md.replace(r"\(", "$").replace(r"\)", "$")
@@ -83,6 +72,7 @@ def normalize_math_delimiters(md: str) -> str:
 
 
 TAG_RE = re.compile(r"\\tag\{([^}]+)\}")
+
 
 def tag_to_text_in_equation(md: str) -> str:
     """
@@ -94,38 +84,102 @@ def tag_to_text_in_equation(md: str) -> str:
         if not (t.startswith("(") and t.endswith(")")):
             t = f"({t})"
         return rf"\qquad {t}"
+
     return TAG_RE.sub(repl, md)
 
 
-def downscale_image_to_png_bytes(img: Image.Image, max_side: int) -> bytes:
+# -----------------------------
+# Image processing: downscale + optional vertical tiling for long images
+# -----------------------------
+def downscale_image(img: Image.Image, max_side: int) -> Image.Image:
     img = img.convert("RGB")
     w, h = img.size
     scale = min(1.0, max_side / max(w, h))
     if scale < 1.0:
         img = img.resize((int(w * scale), int(h * scale)))
+    return img
+
+
+def pil_to_png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def split_long_image_vertical(img: Image.Image, tile_h: int, overlap: int) -> List[Image.Image]:
+    """
+    将长图按竖向切片。每片高度 tile_h，片与片之间重叠 overlap（避免切到行/公式）。
+    """
+    w, h = img.size
+    if h <= tile_h:
+        return [img]
+
+    overlap = max(0, min(overlap, tile_h // 2))
+    step = tile_h - overlap
+    tiles: List[Image.Image] = []
+
+    y0 = 0
+    while y0 < h:
+        y1 = min(y0 + tile_h, h)
+        tile = img.crop((0, y0, w, y1))
+        tiles.append(tile)
+        if y1 >= h:
+            break
+        y0 = y0 + step
+
+    return tiles
+
+
+def _norm_line(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def dedup_overlap_by_lines(prev_md: str, next_md: str, max_check_lines: int = 8) -> str:
+    """
+    对“重叠切片”拼接时的重复内容做轻量去重：
+    如果 prev 末尾若干行 与 next 开头若干行完全一致（忽略空白差异），就删掉 next 的重复开头。
+    """
+    prev_lines_raw = prev_md.splitlines()
+    next_lines_raw = next_md.splitlines()
+
+    prev_lines = [_norm_line(x) for x in prev_lines_raw if _norm_line(x)]
+    next_lines = [_norm_line(x) for x in next_lines_raw if _norm_line(x)]
+
+    if not prev_lines or not next_lines:
+        return next_md
+
+    k = min(max_check_lines, len(prev_lines), len(next_lines))
+    # 从长到短匹配
+    for m in range(k, 1, -1):
+        if prev_lines[-m:] == next_lines[:m]:
+            # 删除 next_md 中对应的前 m 个“非空行”
+            new_lines = []
+            removed = 0
+            for line in next_lines_raw:
+                if removed < m and _norm_line(line):
+                    removed += 1
+                    continue
+                new_lines.append(line)
+            return "\n".join(new_lines).lstrip("\n")
+
+    return next_md
 
 
 # -----------------------------
 # DOCX mode A: Editable equations via pandoc (LaTeX -> OMML)
 # -----------------------------
 def markdown_to_docx_editable(md_text: str) -> bytes:
-    # pandoc wants a file output
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
         out_path = f.name
-
     try:
-        # markdown+tex_math_dollars tells pandoc to treat $...$/$$...$$ as math
         pypandoc.convert_text(
             md_text,
             to="docx",
             format="markdown+tex_math_dollars+raw_tex",
             outputfile=out_path,
-            extra_args=[
-                "--wrap=none",
-            ],
+            extra_args=["--wrap=none"],
         )
         with open(out_path, "rb") as r:
             return r.read()
@@ -156,7 +210,6 @@ def docx_plain_latex(md_text: str) -> bytes:
     doc = Document()
     set_doc_style(doc)
 
-    # very simple line-based writing: preserve text and $$ blocks as is
     lines = md_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     for line in lines:
         if line.strip().startswith("$$") or line.strip().endswith("$$"):
@@ -174,8 +227,8 @@ def docx_plain_latex(md_text: str) -> bytes:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="多图 OCR → Word(可编辑公式)", layout="wide")
-st.title("多图 OCR（Gemini）→ Word 文档（公式可编辑/或 LaTeX 原样）")
+st.set_page_config(page_title="多图 OCR → Word(可编辑公式) + 长图切片", layout="wide")
+st.title("多图 OCR（Gemini）→ Word 文档（公式可编辑 / 或 LaTeX 原样）")
 
 col1, col2 = st.columns([1, 1])
 with col1:
@@ -189,39 +242,66 @@ with col1:
         ["gemini-3-flash-preview", "gemini-3-pro-preview"],
         index=0,
     )
+
 with col2:
     export_mode = st.radio(
         "导出 Word 方式",
         ["可编辑公式（推荐）", "LaTeX 原样（纯文本）"],
         index=0,
-        help="可编辑公式模式会用 pandoc 把 LaTeX 转成 Word 原生公式；纯文本模式只保留 $$...$$。",
     )
     max_side = st.slider("最大边长（下采样提速）", 800, 3500, 2000, 50)
     keep_tag = st.checkbox("把 \\tag{n} 变成公式末尾编号（更稳）", value=True)
 
+    # ✅ 新增：长图切片控制（不影响其他功能）
+    st.markdown("**长图切片（解决超长图片只识别上半部分）**")
+    enable_tiling = st.checkbox("对超长图片自动切片", value=True)
+    tile_h = st.slider("单片高度（像素，按下采样后的尺寸）", 700, 2000, 1200, 50)
+    overlap = st.slider("相邻切片重叠（像素）", 0, 400, 120, 10)
+
 if not files:
     st.stop()
 
-# Preview images
 with st.expander("预览上传的图片", expanded=True):
     for f in files:
         st.image(Image.open(f), caption=f.name, use_container_width=True)
 
 if st.button("开始识别并生成 Word", type="primary"):
     all_md: List[str] = []
-    with st.spinner("正在逐张识别（多图）..."):
-        for idx, f in enumerate(files, start=1):
+
+    with st.spinner("正在逐张识别（支持长图切片）..."):
+        for img_idx, f in enumerate(files, start=1):
             img = Image.open(f)
-            img_bytes = downscale_image_to_png_bytes(img, max_side=max_side)
-            md = gemini_ocr_one(img_bytes, "image/png", model_id)
-            md = normalize_math_delimiters(md)
-            if keep_tag:
-                md = tag_to_text_in_equation(md)
+            img = downscale_image(img, max_side=max_side)
 
-            # add a page title to keep order
-            all_md.append(f"## 第 {idx} 页\n\n{md}\n")
+            # ✅ 新增：对长图切片
+            tiles = [img]
+            if enable_tiling:
+                # 超过阈值才切（避免短图也切）
+                if img.size[1] > tile_h:
+                    tiles = split_long_image_vertical(img, tile_h=tile_h, overlap=overlap)
 
-    # Add pagebreak between images for docx
+            page_parts: List[str] = []
+
+            for part_idx, tile in enumerate(tiles, start=1):
+                tile_bytes = pil_to_png_bytes(tile)
+                md_part = gemini_ocr_one(tile_bytes, "image/png", model_id)
+
+                md_part = normalize_math_delimiters(md_part)
+                if keep_tag:
+                    md_part = tag_to_text_in_equation(md_part)
+
+                # 轻量去重：处理切片重叠造成的重复段落
+                if page_parts:
+                    md_part = dedup_overlap_by_lines(page_parts[-1], md_part, max_check_lines=8)
+
+                page_parts.append(md_part)
+
+            # 合并该“第 img_idx 张图片”的所有切片 OCR 结果
+            page_md = "\n\n".join([p for p in page_parts if p.strip()])
+
+            # 保持你原来的分页与顺序
+            all_md.append(f"## 第 {img_idx} 页\n\n{page_md}\n")
+
     merged_md = "\n\n\\newpage\n\n".join(all_md)
 
     st.subheader("合并后的识别结果（Markdown）")
@@ -233,7 +313,7 @@ if st.button("开始识别并生成 Word", type="primary"):
                 docx_bytes = markdown_to_docx_editable(merged_md)
             except Exception as e:
                 st.warning(
-                    "可编辑公式转换失败（通常是 pandoc 环境问题）。已自动改为 LaTeX 原样（纯文本）导出。\n"
+                    "可编辑公式转换失败（pandoc 环境问题）。已自动改为 LaTeX 原样（纯文本）导出。\n"
                     f"错误信息：{e}"
                 )
                 docx_bytes = docx_plain_latex(merged_md)
