@@ -27,50 +27,86 @@ except:
     pass
 
 # ==========================================
-# 1. AI 识别模块 (已升级为 Pro 版)
+# 1. 智能 AI 识别模块 (自动降级与轮询)
 # ==========================================
 def extract_content_with_gemini(api_key, image):
+    # 配置 API
     try:
         genai.configure(api_key=api_key)
-        
-        # --- 升级配置 ---
-        # 使用 Pro 模型：推理能力更强，视觉细节识别更精准
-        model_name = 'gemini-1.5-pro'
-        
-        # 配置生成参数
-        generation_config = {
-            "temperature": 0.1, # 低温度保证输出稳定性
-            "top_p": 1,
-            "top_k": 32,
-            "max_output_tokens": 8192,
-        }
-        
-        model = genai.GenerativeModel(model_name=model_name, generation_config=generation_config)
-        
-        prompt = """
-        你是一个专业的排版转换工具。请将图片内容转换为文档，要求如下：
-        1. 【识别精准】：识别图片中的所有中文、英文文本和数学公式。
-        2. 【LaTeX 格式】：所有数学公式必须写成标准的 LaTeX 格式。
-           - 简单的变量（如 x, N, t）用单美元符号：$x$
-           - 复杂的公式（如带上下标、求和、分数）用双美元符号：$$ ... $$
-        3. 【保持结构】：严格保持原文的段落结构。
-        4. 【输出纯净】：只输出内容，不要任何 Markdown 代码块标记，不要 "Here is the output" 等废话。
-        """
-        
-        with st.spinner(f'正在连接 Google {model_name} (高级版) 模型进行识别，请稍候...'):
+    except Exception as e:
+        st.error(f"API Key 配置失败: {e}")
+        return None
+
+    # 定义模型尝试列表：优先使用最强模型，如果环境不支持则自动降级
+    # 1. gemini-1.5-pro: 最强，识别复杂公式下标最准
+    # 2. gemini-1.5-flash: 速度最快
+    # 3. gemini-pro-vision: 1.0版本，兼容旧版 SDK (防止 404 错误)
+    model_candidates = [
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+        "gemini-pro-vision"
+    ]
+
+    prompt = """
+    你是一个专业的排版转换工具。请将图片内容转换为文档，要求如下：
+    1. 【识别精准】：识别图片中的所有中文、英文文本和数学公式。
+    2. 【LaTeX 格式】：所有数学公式必须写成标准的 LaTeX 格式。
+       - 简单的变量（如 x, N, t）用单美元符号：$x$
+       - 复杂的公式（如带上下标、求和、分数）用双美元符号：$$ ... $$
+    3. 【保持结构】：严格保持原文的段落结构。
+    4. 【输出纯净】：只输出内容，不要任何 Markdown 代码块标记，不要 "Here is the output" 等废话。
+    """
+
+    last_error = None
+    
+    # 创建一个空的占位符用于显示正在尝试的状态
+    status_placeholder = st.empty()
+
+    for model_name in model_candidates:
+        try:
+            status_placeholder.info(f"🔄 正在尝试连接模型: **{model_name}** ...")
+            
+            # 针对不同模型的配置微调
+            generation_config = {"temperature": 0.1, "max_output_tokens": 4096}
+            model = genai.GenerativeModel(model_name=model_name, generation_config=generation_config)
+            
+            # 发送请求
             response = model.generate_content([prompt, image])
             text = response.text
+            
             # 清理 Markdown 标记
             text = text.replace("```latex", "").replace("```markdown", "").replace("```", "")
-            return text.strip()
             
-    except Exception as e:
-        error_msg = str(e)
-        if "404" in error_msg:
-             st.error(f"模型未找到 (404)。请确保 requirements.txt 中 google-generativeai 版本 >= 0.7.2。错误信息: {error_msg}")
+            status_placeholder.success(f"✅ 成功连接模型: {model_name}")
+            time.sleep(1) # 让用户看到成功提示
+            status_placeholder.empty() # 清除提示
+            return text.strip()
+
+        except Exception as e:
+            error_str = str(e)
+            print(f"模型 {model_name} 失败: {error_str}")
+            # 如果是 404 (模型未找到)，继续尝试下一个；如果是 403 (Key无效)，直接停止
+            if "403" in error_str:
+                status_placeholder.error("API Key 无效或没有权限。请检查 Key 是否正确。")
+                return None
+            last_error = e
+            continue
+    
+    # 如果所有模型都失败了
+    status_placeholder.empty()
+    st.error("❌ 所有模型连接均失败。")
+    
+    # 给出具体的调试建议
+    if last_error:
+        err_msg = str(last_error)
+        if "404" in err_msg:
+            st.error("⚠️ 核心原因：服务器 SDK 版本过旧，找不到新模型。")
+            st.warning("👉 请务必在 Streamlit 后台点击 'Reboot' (重启) 以强制更新环境。")
+            st.code(f"当前检测到的 SDK 版本: {genai.__version__}\n(需要 >= 0.7.2 才能支持 1.5 Pro)", language="text")
         else:
-            st.error(f"连接失败: {error_msg}")
-        return None
+            st.error(f"错误详情: {err_msg}")
+            
+    return None
 
 # ==========================================
 # 2. 公式渲染模块 (转透明高清图)
@@ -145,7 +181,13 @@ def create_professional_doc(raw_text):
 # ==========================================
 # 4. 界面主逻辑
 # ==========================================
-st.title("✒️ MathScan Pro：印刷级公式还原 (高级版)")
+st.title("✒️ MathScan Pro：印刷级公式还原 (智能版)")
+
+# 诊断信息：在侧边栏底部悄悄显示版本，方便调试
+with st.sidebar:
+    st.divider()
+    st.caption(f"🔧 SDK Version: {genai.__version__}")
+    st.caption("如果是 0.5.x 或更低，请更新 requirements.txt 并重启 App")
 
 # 输入框置顶
 with st.container():
