@@ -1,325 +1,513 @@
-import io
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import re
+import io
+import time
+import json
+import math
 import tempfile
-from typing import List, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple, Optional
 
+import numpy as np
 import streamlit as st
 from PIL import Image
 
+# Gemini
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
+# Pandoc
 import pypandoc
-from docx import Document
-from docx.shared import Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-
+import pypandoc_binary  # noqa: F401  (ensures pandoc is available)
 
 # -----------------------------
-# Gemini OCR prompt (Chinese + LaTeX in-place)
+# UI basics
 # -----------------------------
-OCR_PROMPT_ZH = """你是一个用于学术文档的 OCR 引擎。
+st.set_page_config(page_title="Gemini OCR → Word (LaTeX)", layout="wide")
 
-要求：
-1) 把图片中所有可见文字逐字转写（保持中文，不要翻译，不要改写）。
-2) 所有数学表达式必须转为 LaTeX，并保持在原本位置（行内/独立公式都要正确）。
-3) 只输出 Markdown（不要输出解释）。
-   - 行内公式必须用 $...$
-   - 独立居多行公式必须用 $$...$$（单独成段）
-4) 保持原有阅读顺序、换行、项目符号、标题层级。
-5) 看不清的内容用 [UNK]，不要猜。
-
-注意：
-- 不要给每个英文字母都强行加 $，只在确实是数学符号/变量时才用。
-- 如果原图有公式编号（例如 (1)(2) 或 \\tag{1}），请保留编号信息。
-只输出 Markdown。
-"""
-
-
-@st.cache_data(show_spinner=False)
-def gemini_ocr_one(image_bytes: bytes, mime_type: str, model_id: str) -> str:
-    api_key = st.secrets.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("缺少 GEMINI_API_KEY：请在 Streamlit Cloud 的 Secrets 中配置。")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model=model_id,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            OCR_PROMPT_ZH,
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=1,
-            max_output_tokens=8192,
-        ),
-    )
-    return (resp.text or "").strip()
-
+TITLE = "Gemini OCR（多图/长图切片）→ Word 导出（含第三版 LaTeX 代码） + Word 转 LaTeX 代码"
+st.title(TITLE)
 
 # -----------------------------
-# Preprocess Markdown for better docx conversion
+# Prompts
 # -----------------------------
-def normalize_math_delimiters(md: str) -> str:
-    md = md.replace(r"\(", "$").replace(r"\)", "$")
-    md = md.replace(r"\[", "$$").replace(r"\]", "$$")
-    return md
+OCR_PROMPT_ZH = r"""
+你是一个严谨的中文学术 OCR 转写器。请从图片中提取内容并输出 **Markdown**，要求：
+1) 文字保持中文、语句通顺、稍微美观（适当分段、标题加粗/##），但不要乱改原意。
+2) 公式必须转为 LaTeX：
+   - 行间公式用 $$ ... $$（保留 \tag{n} 若图片里有编号）
+   - 行内公式用 $ ... $
+3) 保持原本的顺序与相对位置：段落/公式出现的位置尽量与图片一致。
+4) 不要输出“我看到了什么/解释/推导”，只输出最终 Markdown 正文。
+5) 如果某一块是表格，请用 Markdown 表格输出（不要用大量对齐空格）。
+6) 若图片里有页眉页脚/无关按钮元素，忽略。
+输出：仅 Markdown，不要 JSON，不要代码块包裹全文。
+""".strip()
 
-
-TAG_RE = re.compile(r"\\tag\{([^}]+)\}")
-
-
-def tag_to_text_in_equation(md: str) -> str:
-    """
-    pandoc 对 \\tag 兼容性不稳定。
-    这里把 \\tag{1} 变成 \\qquad (1) 放在公式末尾，保证编号能显示。
-    """
-    def repl(m):
-        t = m.group(1).strip()
-        if not (t.startswith("(") and t.endswith(")")):
-            t = f"({t})"
-        return rf"\qquad {t}"
-
-    return TAG_RE.sub(repl, md)
-
+FORMULA_ONLY_PROMPT = r"""
+你会收到一张图片，这张图片大概率是“公式截图/公式图片”。
+任务：如果它确实是数学公式/符号表达式，请只输出 **LaTeX 代码**（不要解释，不要前后文字，不要 $$ 包裹）。
+如果不是公式（例如普通插图、地图、照片），请输出空字符串。
+""".strip()
 
 # -----------------------------
-# Image processing: downscale + optional vertical tiling for long images
+# Helpers: image preprocess
 # -----------------------------
-def downscale_image(img: Image.Image, max_side: int) -> Image.Image:
-    img = img.convert("RGB")
-    w, h = img.size
-    scale = min(1.0, max_side / max(w, h))
-    if scale < 1.0:
-        img = img.resize((int(w * scale), int(h * scale)))
+def load_pil(uploaded_file) -> Image.Image:
+    img = Image.open(uploaded_file).convert("RGB")
     return img
 
+def downscale_max_side(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    nw, nh = int(w * scale), int(h * scale)
+    return img.resize((nw, nh), Image.LANCZOS)
 
-def pil_to_png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def split_long_image_vertical(img: Image.Image, tile_h: int, overlap: int) -> List[Image.Image]:
-    """
-    将长图按竖向切片。每片高度 tile_h，片与片之间重叠 overlap（避免切到行/公式）。
-    """
+def slice_long_image(img: Image.Image, tile_h: int, overlap: int) -> List[Tuple[Image.Image, Tuple[int,int,int,int]]]:
+    """Vertical slicing with overlap. Returns list of (tile_img, (left, top, right, bottom))."""
     w, h = img.size
     if h <= tile_h:
-        return [img]
-
-    overlap = max(0, min(overlap, tile_h // 2))
-    step = tile_h - overlap
-    tiles: List[Image.Image] = []
-
-    y0 = 0
-    while y0 < h:
-        y1 = min(y0 + tile_h, h)
-        tile = img.crop((0, y0, w, y1))
-        tiles.append(tile)
-        if y1 >= h:
+        return [(img, (0, 0, w, h))]
+    tiles = []
+    y = 0
+    while y < h:
+        top = y
+        bottom = min(y + tile_h, h)
+        tile = img.crop((0, top, w, bottom))
+        tiles.append((tile, (0, top, w, bottom)))
+        if bottom >= h:
             break
-        y0 = y0 + step
-
+        y = bottom - overlap
     return tiles
 
-
-def _norm_line(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-def dedup_overlap_by_lines(prev_md: str, next_md: str, max_check_lines: int = 8) -> str:
-    """
-    对“重叠切片”拼接时的重复内容做轻量去重：
-    如果 prev 末尾若干行 与 next 开头若干行完全一致（忽略空白差异），就删掉 next 的重复开头。
-    """
-    prev_lines_raw = prev_md.splitlines()
-    next_lines_raw = next_md.splitlines()
-
-    prev_lines = [_norm_line(x) for x in prev_lines_raw if _norm_line(x)]
-    next_lines = [_norm_line(x) for x in next_lines_raw if _norm_line(x)]
-
-    if not prev_lines or not next_lines:
-        return next_md
-
-    k = min(max_check_lines, len(prev_lines), len(next_lines))
-    # 从长到短匹配
-    for m in range(k, 1, -1):
-        if prev_lines[-m:] == next_lines[:m]:
-            # 删除 next_md 中对应的前 m 个“非空行”
-            new_lines = []
-            removed = 0
-            for line in next_lines_raw:
-                if removed < m and _norm_line(line):
-                    removed += 1
-                    continue
-                new_lines.append(line)
-            return "\n".join(new_lines).lstrip("\n")
-
-    return next_md
-
+def pil_to_jpeg_bytes(img: Image.Image, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 # -----------------------------
-# DOCX mode A: Editable equations via pandoc (LaTeX -> OMML)
+# Helpers: Markdown postprocess / dedupe
 # -----------------------------
-def markdown_to_docx_editable(md_text: str) -> bytes:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
-        out_path = f.name
-    try:
-        pypandoc.convert_text(
-            md_text,
-            to="docx",
-            format="markdown+tex_math_dollars+raw_tex",
-            outputfile=out_path,
-            extra_args=["--wrap=none"],
-        )
-        with open(out_path, "rb") as r:
-            return r.read()
-    finally:
+def normalize_md(md: str) -> str:
+    md = md.replace("\r\n", "\n").replace("\r", "\n")
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
+
+def dedupe_adjacent_chunks(chunks: List[str]) -> str:
+    """
+    Simple overlap-dedupe: remove identical tail/head blocks due to overlapped tiles.
+    """
+    chunks = [normalize_md(c) for c in chunks if c and c.strip()]
+    if not chunks:
+        return ""
+    out = [chunks[0]]
+    for cur in chunks[1:]:
+        prev = out[-1]
+        # Compare last N lines of prev with first N lines of cur
+        prev_lines = prev.splitlines()
+        cur_lines = cur.splitlines()
+        max_n = min(30, len(prev_lines), len(cur_lines))
+        cut = 0
+        for n in range(max_n, 5, -1):
+            if prev_lines[-n:] == cur_lines[:n]:
+                cut = n
+                break
+        if cut > 0:
+            cur = "\n".join(cur_lines[cut:]).strip()
+        if cur:
+            out.append(cur)
+    return normalize_md("\n\n".join(out))
+
+# -----------------------------
+# Helpers: math -> code version (third download)
+# -----------------------------
+INLINE_MATH = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$")
+DISPLAY_MATH = re.compile(r"(?s)(?<!\\)\$\$(.+?)(?<!\\)\$\$")
+
+def md_math_to_code(md: str) -> str:
+    """
+    Convert math rendering into LaTeX CODE blocks/text:
+      $$ ... $$  -> ```latex\n$$ ... $$\n```
+      $ ... $    -> ` $ ... $ `
+    """
+    def repl_display(m):
+        body = m.group(1).strip()
+        return "\n```latex\n$$ " + body + " $$\n```\n"
+    md2 = DISPLAY_MATH.sub(repl_display, md)
+
+    def repl_inline(m):
+        body = m.group(1).strip()
+        return "`$ " + body + " $`"
+    md2 = INLINE_MATH.sub(repl_inline, md2)
+    return normalize_md(md2)
+
+# -----------------------------
+# Pandoc conversions
+# -----------------------------
+def md_to_docx(md_text: str, out_path: Path) -> Path:
+    md_text = normalize_md(md_text) + "\n"
+    # Ensure pandoc available
+    _ = pypandoc.get_pandoc_path()
+    # Use markdown with tex math dollars
+    fmt = "markdown+tex_math_dollars+tex_math_single_backslash"
+    pypandoc.convert_text(md_text, to="docx", format=fmt, outputfile=str(out_path))
+    return out_path
+
+def docx_to_md(docx_path: Path, media_dir: Path) -> str:
+    media_dir.mkdir(parents=True, exist_ok=True)
+    fmt = "docx"
+    md = pypandoc.convert_file(
+        str(docx_path),
+        to="markdown",
+        format=fmt,
+        extra_args=[f"--extract-media={str(media_dir)}"]
+    )
+    return normalize_md(md)
+
+# -----------------------------
+# Gemini client + safe call
+# -----------------------------
+@dataclass
+class GeminiResult:
+    text: str
+    status_code: Optional[int] = None
+    error_message: Optional[str] = None
+    raw_error: Optional[str] = None
+
+def get_gemini_client() -> genai.Client:
+    api_key = None
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+    if not api_key:
+        st.stop()
+
+    # Force Gemini Developer API (NOT Vertex AI)
+    # If your environment accidentally sets Vertex-related vars, this avoids 401 "API keys not supported..."
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
+    return client
+
+def safe_generate_content(
+    client: genai.Client,
+    model_id: str,
+    contents,
+    config: Optional[types.GenerateContentConfig] = None,
+    retries: int = 3,
+    sleep_base: float = 1.2
+) -> GeminiResult:
+    last_err = None
+    for attempt in range(retries):
         try:
-            os.remove(out_path)
-        except Exception:
-            pass
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=config,
+            )
+            return GeminiResult(text=(resp.text or "").strip())
+        except genai_errors.ClientError as e:
+            # Key point: do NOT crash streamlit; expose status_code & message safely
+            status = getattr(e, "status_code", None)
+            msg = str(e)
+            return GeminiResult(text="", status_code=status, error_message=msg, raw_error=repr(e))
+        except genai_errors.ServerError as e:
+            # 5xx -> retry
+            last_err = e
+            time.sleep(sleep_base * (2 ** attempt))
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_base * (2 ** attempt))
 
+    # If we reached here, retries exhausted
+    msg = f"{type(last_err).__name__}: {last_err}"
+    return GeminiResult(text="", status_code=None, error_message=msg, raw_error=repr(last_err))
 
-# -----------------------------
-# DOCX mode B: Keep LaTeX as plain text in docx (no images)
-# -----------------------------
-def set_doc_style(doc: Document):
-    sec = doc.sections[0]
-    sec.top_margin = Cm(2.0)
-    sec.bottom_margin = Cm(2.0)
-    sec.left_margin = Cm(2.0)
-    sec.right_margin = Cm(2.0)
+def gemini_ocr_one_image(
+    client: genai.Client,
+    model_id: str,
+    image_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+    max_output_tokens: int = 4096,
+) -> GeminiResult:
+    # If inline bytes too large, use Files API automatically (20MB request limit) :contentReference[oaicite:4]{index=4}
+    part = None
+    if len(image_bytes) > 18_000_000:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            f.write(image_bytes)
+            tmp = f.name
+        up = client.files.upload(file=tmp)
+        os.unlink(tmp)
+        contents = [up, prompt]
+    else:
+        part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        contents = [part, prompt]  # prompt after image (best practice) :contentReference[oaicite:5]{index=5}
 
-    style = doc.styles["Normal"]
-    style.font.name = "Times New Roman"
-    style.font.size = Pt(11)
-    style._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-
-
-def docx_plain_latex(md_text: str) -> bytes:
-    doc = Document()
-    set_doc_style(doc)
-
-    lines = md_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    for line in lines:
-        if line.strip().startswith("$$") or line.strip().endswith("$$"):
-            p = doc.add_paragraph(line)
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        else:
-            doc.add_paragraph(line)
-
-    out = io.BytesIO()
-    doc.save(out)
-    out.seek(0)
-    return out.getvalue()
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="多图 OCR → Word(可编辑公式) + 长图切片", layout="wide")
-st.title("多图 OCR（Gemini）→ Word 文档（公式可编辑 / 或 LaTeX 原样）")
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    files = st.file_uploader(
-        "上传图片（可多选：png/jpg/webp）",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
+    cfg = types.GenerateContentConfig(
+        # 对 Gemini 3：官方建议 temperature 保持默认 1.0（避免循环/异常行为） :contentReference[oaicite:6]{index=6}
+        temperature=1.0,
+        max_output_tokens=max_output_tokens,
     )
+    return safe_generate_content(client, model_id, contents, cfg)
+
+# -----------------------------
+# Render preview with MathJax (in-place)
+# -----------------------------
+MATHJAX_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<script>
+window.MathJax = {
+  tex: {
+    inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
+    displayMath: [['$$','$$'], ['\\\\[','\\\\]']],
+    processEscapes: true,
+    tags: 'ams'
+  },
+  options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif; line-height: 1.55; padding: 6px 10px; }
+h1,h2,h3 { margin: 0.6em 0 0.3em; }
+pre, code { background: #f6f6f6; padding: 2px 4px; border-radius: 4px; }
+table { border-collapse: collapse; }
+td,th { border: 1px solid #ddd; padding: 6px 8px; }
+</style>
+</head>
+<body>
+<div id="content">{{CONTENT}}</div>
+<script>
+(function(){
+  // simple markdown-ish conversion for preview (keep it light)
+  const el = document.getElementById("content");
+  let t = el.textContent;
+  // Convert headings
+  t = t.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+  t = t.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+  t = t.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+  // bold
+  t = t.replace(/\\*\\*(.+?)\\*\\*/g, "<b>$1</b>");
+  // line breaks
+  t = t.replace(/\\n/g, "<br/>");
+  el.innerHTML = t;
+})();
+</script>
+</body>
+</html>
+"""
+
+def render_mathjax(md: str):
+    import html
+    safe = html.escape(md)
+    html_doc = MATHJAX_HTML.replace("{{CONTENT}}", safe)
+    st.components.v1.html(html_doc, height=600, scrolling=True)
+
+# -----------------------------
+# UI: Model select + debug panel
+# -----------------------------
+with st.sidebar:
+    st.subheader("Gemini 设置")
     model_id = st.selectbox(
-        "模型（Flash 更快，Pro 更稳）",
-        ["gemini-3-flash-preview", "gemini-3-pro-preview"],
-        index=0,
+        "Model ID",
+        [
+            "gemini-3-flash-preview",
+            "gemini-flash-latest",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+        ],
+        index=0
     )
+    max_side = st.slider("Max side length (downscale if larger)", 800, 3200, 2000, 100)
+    tile_h = st.slider("Long image tile height", 800, 2600, 1600, 100)
+    overlap = st.slider("Tile overlap (px)", 0, 400, 160, 10)
+    jpeg_q = st.slider("JPEG quality (smaller=faster)", 50, 95, 85, 1)
+    out_tokens = st.slider("Max output tokens", 1024, 8192, 4096, 256)
 
-with col2:
-    export_mode = st.radio(
-        "导出 Word 方式",
-        ["可编辑公式（推荐）", "LaTeX 原样（纯文本）"],
-        index=0,
-    )
-    max_side = st.slider("最大边长（下采样提速）", 800, 3500, 2000, 50)
-    keep_tag = st.checkbox("把 \\tag{n} 变成公式末尾编号（更稳）", value=True)
+    st.divider()
+    st.caption("如果你遇到红框报错：下面的页面会显示 status_code 和 message，按错误码处理即可。")
 
-    # ✅ 新增：长图切片控制（不影响其他功能）
-    st.markdown("**长图切片（解决超长图片只识别上半部分）**")
-    enable_tiling = st.checkbox("对超长图片自动切片", value=True)
-    tile_h = st.slider("单片高度（像素，按下采样后的尺寸）", 700, 2000, 1200, 50)
-    overlap = st.slider("相邻切片重叠（像素）", 0, 400, 120, 10)
+tabs = st.tabs(["① 图片 OCR → Word 导出", "② 上传 Word(docx) → 公式转 LaTeX 代码并替换输出"])
 
-if not files:
-    st.stop()
+# -----------------------------
+# TAB 1: Image OCR -> Word
+# -----------------------------
+with tabs[0]:
+    st.subheader("① 图片 OCR（支持多图 + 长图自动切片）")
+    imgs = st.file_uploader("上传 1 张或多张图片（png/jpg/webp）", type=["png","jpg","jpeg","webp"], accept_multiple_files=True)
 
-with st.expander("预览上传的图片", expanded=True):
-    for f in files:
-        st.image(Image.open(f), caption=f.name, use_container_width=True)
+    run = st.button("Run OCR", type="primary", disabled=(not imgs))
+    if run and imgs:
+        client = get_gemini_client()
 
-if st.button("开始识别并生成 Word", type="primary"):
-    all_md: List[str] = []
+        all_md_parts = []
+        debug_rows = []
 
-    with st.spinner("正在逐张识别（支持长图切片）..."):
-        for img_idx, f in enumerate(files, start=1):
-            img = Image.open(f)
-            img = downscale_image(img, max_side=max_side)
+        for idx, f in enumerate(imgs, start=1):
+            img = load_pil(f)
+            img = downscale_max_side(img, max_side=max_side)
+            tiles = slice_long_image(img, tile_h=tile_h, overlap=overlap)
 
-            # ✅ 新增：对长图切片
-            tiles = [img]
-            if enable_tiling:
-                # 超过阈值才切（避免短图也切）
-                if img.size[1] > tile_h:
-                    tiles = split_long_image_vertical(img, tile_h=tile_h, overlap=overlap)
+            st.write(f"**Image {idx}:** {img.size[0]}×{img.size[1]}  → tiles: {len(tiles)}")
 
-            page_parts: List[str] = []
-
-            for part_idx, tile in enumerate(tiles, start=1):
-                tile_bytes = pil_to_png_bytes(tile)
-                md_part = gemini_ocr_one(tile_bytes, "image/png", model_id)
-
-                md_part = normalize_math_delimiters(md_part)
-                if keep_tag:
-                    md_part = tag_to_text_in_equation(md_part)
-
-                # 轻量去重：处理切片重叠造成的重复段落
-                if page_parts:
-                    md_part = dedup_overlap_by_lines(page_parts[-1], md_part, max_check_lines=8)
-
-                page_parts.append(md_part)
-
-            # 合并该“第 img_idx 张图片”的所有切片 OCR 结果
-            page_md = "\n\n".join([p for p in page_parts if p.strip()])
-
-            # 保持你原来的分页与顺序
-            all_md.append(f"## 第 {img_idx} 页\n\n{page_md}\n")
-
-    merged_md = "\n\n\\newpage\n\n".join(all_md)
-
-    st.subheader("合并后的识别结果（Markdown）")
-    st.code(merged_md, language="markdown")
-
-    with st.spinner("生成 Word 文档..."):
-        if export_mode == "可编辑公式（推荐）":
-            try:
-                docx_bytes = markdown_to_docx_editable(merged_md)
-            except Exception as e:
-                st.warning(
-                    "可编辑公式转换失败（pandoc 环境问题）。已自动改为 LaTeX 原样（纯文本）导出。\n"
-                    f"错误信息：{e}"
+            tile_mds = []
+            for ti, (tile, box) in enumerate(tiles, start=1):
+                b = pil_to_jpeg_bytes(tile, quality=jpeg_q)
+                res = gemini_ocr_one_image(
+                    client=client,
+                    model_id=model_id,
+                    image_bytes=b,
+                    mime_type="image/jpeg",
+                    prompt=OCR_PROMPT_ZH,
+                    max_output_tokens=out_tokens,
                 )
-                docx_bytes = docx_plain_latex(merged_md)
-        else:
-            docx_bytes = docx_plain_latex(merged_md)
 
-    st.success("已生成 Word 文档。")
-    st.download_button("下载 result.docx", data=docx_bytes, file_name="result.docx")
-    st.download_button("下载 result.md", data=merged_md.encode("utf-8"), file_name="result.md")
+                debug_rows.append({
+                    "img": idx,
+                    "tile": ti,
+                    "box": box,
+                    "bytes": len(b),
+                    "status_code": res.status_code,
+                    "error": (res.error_message[:200] if res.error_message else ""),
+                })
+
+                if res.error_message:
+                    st.error(f"Gemini error on Image {idx} Tile {ti}: status={res.status_code} message={res.error_message}")
+                    # 官方建议：按 status code 对照处理（FAILED_PRECONDITION/429/INVALID_ARGUMENT 等） :contentReference[oaicite:7]{index=7}
+                    st.stop()
+
+                tile_mds.append(res.text)
+
+            merged = dedupe_adjacent_chunks(tile_mds)
+            all_md_parts.append(merged)
+
+        final_md = normalize_md("\n\n---\n\n".join(all_md_parts))
+        st.success("OCR 完成")
+
+        colA, colB = st.columns([1,1], gap="large")
+        with colA:
+            st.markdown("### Rendered (MathJax, in-place)")
+            render_mathjax(final_md)
+
+        with colB:
+            st.markdown("### Raw Markdown")
+            st.code(final_md, language="markdown")
+
+        # Export files (3 versions)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            md_path = td / "ocr.md"
+            md_path.write_text(final_md, encoding="utf-8")
+
+            docx_rendered = td / "OCR_Rendered.docx"
+            md_to_docx(final_md, docx_rendered)
+
+            latex_code_md = md_math_to_code(final_md)
+            docx_latex_code = td / "OCR_LaTeX_Code.docx"
+            md_to_docx(latex_code_md, docx_latex_code)
+
+            st.download_button("下载版本1：Rendered Word (.docx)", data=docx_rendered.read_bytes(), file_name=docx_rendered.name)
+            st.download_button("下载版本2：Raw Markdown (.md)", data=md_path.read_bytes(), file_name=md_path.name)
+            st.download_button("下载版本3：LaTeX 代码版 Word (.docx)", data=docx_latex_code.read_bytes(), file_name=docx_latex_code.name)
+
+        with st.expander("Debug（如果你再遇到 ClientError，先看这里）", expanded=False):
+            st.json(debug_rows)
+
+# -----------------------------
+# TAB 2: Word -> LaTeX code
+# -----------------------------
+with tabs[1]:
+    st.subheader("② 上传 Word(.docx) → 把公式转成 LaTeX 代码形式并替换输出")
+    st.caption("说明：docx 内原生公式（OMML）Pandoc 会转成 $...$/$$...$$；若有“公式截图图片”，会尝试用 Gemini 识别为 LaTeX 后替换。")
+
+    docx_file = st.file_uploader("上传 Word (.docx)", type=["docx"])
+    run2 = st.button("Convert Word → LaTeX Code Word", type="primary", disabled=(not docx_file))
+
+    if run2 and docx_file:
+        client = get_gemini_client()
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            src = td / "input.docx"
+            src.write_bytes(docx_file.read())
+
+            media_dir = td / "media"
+            md = docx_to_md(src, media_dir=media_dir)
+
+            # 1) turn docx math to code style (wrap existing $/$$)
+            md2 = md_math_to_code(md)
+
+            # 2) replace formula-like images in markdown
+            # markdown image pattern: ![](media/image.png)
+            img_pat = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+            replacements = {}
+            for m in img_pat.finditer(md2):
+                rel = m.group(1)
+                # pandoc usually uses something like media/image1.png
+                p = (td / rel).resolve()
+                if not p.exists():
+                    continue
+
+                try:
+                    im = Image.open(p).convert("RGB")
+                    w, h = im.size
+                except Exception:
+                    continue
+
+                # heuristic: small & wide images more likely formulas
+                looks_formula = (h <= 280 and w >= 240) or (h <= 220 and w/h >= 2.0)
+                if not looks_formula:
+                    continue
+
+                b = pil_to_jpeg_bytes(im, quality=90)
+                res = gemini_ocr_one_image(
+                    client=client,
+                    model_id=model_id,
+                    image_bytes=b,
+                    mime_type="image/jpeg",
+                    prompt=FORMULA_ONLY_PROMPT,
+                    max_output_tokens=1024,
+                )
+                if res.error_message:
+                    st.error(f"Gemini error while converting formula image: status={res.status_code} message={res.error_message}")
+                    st.stop()
+
+                latex = (res.text or "").strip()
+                if not latex:
+                    continue
+
+                # Replace image markdown with LaTeX code block (you asked for code format)
+                rep = "\n```latex\n$$ " + latex + " $$\n```\n"
+                replacements[m.group(0)] = rep
+
+            for k, v in replacements.items():
+                md2 = md2.replace(k, v)
+
+            md2 = normalize_md(md2)
+
+            out_docx = td / "Word_LaTeX_Code.docx"
+            md_to_docx(md2, out_docx)
+
+            out_md = td / "Word_LaTeX_Code.md"
+            out_md.write_text(md2, encoding="utf-8")
+
+            st.success("转换完成")
+            st.download_button("下载：LaTeX 代码版 Word (.docx)", data=out_docx.read_bytes(), file_name=out_docx.name)
+            st.download_button("下载：中间产物 Markdown (.md)", data=out_md.read_bytes(), file_name=out_md.name)
+
+            st.markdown("### 预览（Raw Markdown）")
+            st.code(md2, language="markdown")
