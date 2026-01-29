@@ -1,125 +1,50 @@
-import hashlib
+import io
 import re
-from typing import Tuple
+import hashlib
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
 import streamlit as st
 from PIL import Image
+
 from google import genai
 from google.genai import types
 
-import markdown as md
-import bleach
+# DOCX
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+
+# LaTeX render -> PNG
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
-# ---------- LaTeX delimiter normalization ----------
-INLINE_OPEN = r"\("
-INLINE_CLOSE = r"\)"
-BLOCK_OPEN = r"\["
-BLOCK_CLOSE = r"\]"
+# -------------------------
+# 1) Gemini OCR（中文 + LaTeX）
+# -------------------------
+OCR_PROMPT_ZH = """你是一个用于学术文档的 OCR 引擎。
 
-def normalize_latex_delimiters(s: str) -> str:
-    # Convert \( \) -> $ $
-    s = s.replace(INLINE_OPEN, "$").replace(INLINE_CLOSE, "$")
-    # Convert \[ \] -> $$ $$
-    s = s.replace(BLOCK_OPEN, "$$").replace(BLOCK_CLOSE, "$$")
-    return s
+要求：
+1) 把图片中所有可见文字逐字转写（保持中文，不要翻译，不要改写）。
+2) 所有数学表达式必须转为 LaTeX，并保持在原本位置（行内/独立公式都要正确）。
+3) 只输出 Markdown（不要输出解释）。
+   - 行内公式必须用 $...$
+   - 独立居中公式必须用 $$...$$（单独成段）
+4) 保持原有阅读顺序、换行、项目符号、标题层级。
+5) 看不清的内容用 [UNK]，不要猜。
 
-
-# ---------- Markdown -> Safe HTML (keep $...$ for MathJax) ----------
-ALLOWED_TAGS = [
-    "p","br","hr","em","strong","ul","ol","li","code","pre","blockquote",
-    "h1","h2","h3","h4","h5","h6","table","thead","tbody","tr","th","td",
-    "span","div"
-]
-ALLOWED_ATTRS = {
-    "*": ["class", "style"],
-    "th": ["colspan", "rowspan"],
-    "td": ["colspan", "rowspan"],
-}
-
-def markdown_to_safe_html(markdown_text: str) -> str:
-    html = md.markdown(markdown_text, extensions=["tables", "fenced_code"])
-    clean = bleach.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
-    return clean
-
-
-def wrap_with_mathjax(html_body: str) -> str:
-    # MathJax config: use $...$ and $$...$$
-    return f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<script>
-window.MathJax = {{
-  tex: {{
-    inlineMath: [['$', '$']],
-    displayMath: [['$$', '$$']],
-    processEscapes: true
-  }},
-  options: {{
-    skipHtmlTags: ['script','noscript','style','textarea','pre','code']
-  }}
-}};
-</script>
-<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-<style>
-body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; padding: 16px; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ border: 1px solid #ddd; padding: 6px 8px; }}
-pre {{ background: #f6f8fa; padding: 10px; overflow-x: auto; }}
-code {{ background: #f6f8fa; padding: 2px 4px; }}
-</style>
-</head>
-<body>
-{html_body}
-</body>
-</html>
+注意：
+- 不要给每个英文字母都强行加 $，只在确实是数学符号/变量时才用。
+- 如果原图有公式编号（例如 (1)(2) 或 \\tag{1}），请保留编号信息。
+只输出 Markdown。
 """
-
-
-# ---------- Gemini OCR ----------
-OCR_PROMPT = """You are an OCR engine for academic documents.
-
-Task:
-1) Transcribe ALL visible text exactly (do not paraphrase, do not translate).
-2) Convert ALL mathematical expressions into LaTeX and keep them in the original position.
-3) Output ONLY Markdown.
-   - Inline math MUST be wrapped with $...$
-   - Display/centered standalone equations MUST be wrapped with $$...$$ on their own lines
-4) Preserve reading order, line breaks, bullet lists, and headings if present.
-5) If a token is unreadable, write [UNK] (do NOT guess).
-
-Return ONLY the Markdown.
-"""
-
-@st.cache_data(show_spinner=False)
-def gemini_ocr_markdown(image_bytes: bytes, mime_type: str, model_id: str) -> str:
-    api_key = st.secrets.get("GEMINI_API_KEY", None)
-    if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY in Streamlit secrets.")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model=model_id,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            OCR_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=1,
-            max_output_tokens=8192,
-        ),
-    )
-    text = resp.text or ""
-    return normalize_latex_delimiters(text)
 
 
 def guess_mime(filename: str) -> str:
-    fn = filename.lower()
+    fn = (filename or "").lower()
     if fn.endswith(".png"):
         return "image/png"
     if fn.endswith(".webp"):
@@ -127,62 +52,356 @@ def guess_mime(filename: str) -> str:
     return "image/jpeg"
 
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="Gemini OCR → LaTeX", layout="wide")
-st.title("Gemini OCR: Image → Text + LaTeX (in-place)")
+@st.cache_data(show_spinner=False)
+def gemini_ocr_markdown(image_bytes: bytes, mime_type: str, model_id: str) -> str:
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("缺少 GEMINI_API_KEY：请在 Streamlit Cloud 的 Secrets 中配置。")
+
+    client = genai.Client(api_key=api_key)
+
+    # 官方示例：types.Part.from_bytes + client.models.generate_content :contentReference[oaicite:3]{index=3}
+    resp = client.models.generate_content(
+        model=model_id,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            OCR_PROMPT_ZH,
+        ],
+        # OCR 场景建议 temperature=0
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+            max_output_tokens=8192,
+        ),
+    )
+    return (resp.text or "").strip()
+
+
+# -------------------------
+# 2) Markdown 解析（保留原位：段落/标题/列表/行内公式/独立公式）
+# -------------------------
+@dataclass
+class Block:
+    kind: str  # "heading" | "ul" | "ol" | "para" | "display_math"
+    text: str
+    level: int = 0
+
+
+def split_markdown_blocks(md: str) -> List[Block]:
+    lines = md.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: List[Block] = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # skip leading blank
+        if line.strip() == "":
+            i += 1
+            continue
+
+        # display math block: $$ ... $$ (may span multiple lines)
+        if line.strip().startswith("$$"):
+            buf = []
+            # if same line contains both start/end
+            if line.strip().endswith("$$") and len(line.strip()) > 4:
+                content = line.strip()[2:-2].strip()
+                blocks.append(Block("display_math", content))
+                i += 1
+                continue
+
+            # start multi-line
+            start = line
+            # remove leading $$
+            buf.append(start.strip()[2:].strip())
+            i += 1
+            while i < len(lines):
+                if lines[i].strip().endswith("$$"):
+                    tail = lines[i].strip()[:-2].strip()
+                    if tail:
+                        buf.append(tail)
+                    break
+                buf.append(lines[i])
+                i += 1
+            blocks.append(Block("display_math", "\n".join(buf).strip()))
+            i += 1
+            continue
+
+        # heading
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            level = len(m.group(1))
+            blocks.append(Block("heading", m.group(2).strip(), level=level))
+            i += 1
+            continue
+
+        # ul / ol item
+        m_ul = re.match(r"^[-*]\s+(.*)$", line)
+        m_ol = re.match(r"^\d+\.\s+(.*)$", line)
+        if m_ul:
+            blocks.append(Block("ul", m_ul.group(1).strip()))
+            i += 1
+            continue
+        if m_ol:
+            blocks.append(Block("ol", m_ol.group(1).strip()))
+            i += 1
+            continue
+
+        # paragraph: merge consecutive non-blank lines until next special block
+        buf = [line]
+        i += 1
+        while i < len(lines):
+            peek = lines[i]
+            if peek.strip() == "":
+                break
+            if peek.strip().startswith("$$"):
+                break
+            if re.match(r"^(#{1,6})\s+", peek):
+                break
+            if re.match(r"^[-*]\s+", peek) or re.match(r"^\d+\.\s+", peek):
+                break
+            buf.append(peek)
+            i += 1
+        blocks.append(Block("para", "\n".join(buf).strip()))
+        i += 1
+
+    return blocks
+
+
+INLINE_MATH_RE = re.compile(r"(\$[^$\n]+\$)")  # 简化版：覆盖大多数常见行内公式
+
+
+def split_inline_math(text: str) -> List[Tuple[str, str]]:
+    """
+    return list of (kind, content)
+    kind: "text" | "math"
+    """
+    parts: List[Tuple[str, str]] = []
+    pos = 0
+    for m in INLINE_MATH_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(("text", text[pos:m.start()]))
+        math = m.group(1)[1:-1]  # remove $ $
+        parts.append(("math", math))
+        pos = m.end()
+    if pos < len(text):
+        parts.append(("text", text[pos:]))
+    return parts
+
+
+def extract_tag(latex: str) -> Tuple[str, Optional[str]]:
+    """
+    支持 \tag{1} 或 \tag{(1)}。返回 (latex_without_tag, tag_text)
+    """
+    m = re.search(r"\\tag\{([^}]+)\}", latex)
+    if not m:
+        return latex, None
+    tag = m.group(1).strip()
+    latex2 = (latex[:m.start()] + latex[m.end():]).strip()
+    # normalize number style
+    if not (tag.startswith("(") and tag.endswith(")")):
+        tag = f"({tag})"
+    return latex2, tag
+
+
+# -------------------------
+# 3) LaTeX 渲染为 PNG（用于插入 Word）
+# -------------------------
+def render_latex_png(latex: str, display: bool, font_size: int = 16, dpi: int = 220) -> io.BytesIO:
+    """
+    用 matplotlib mathtext 渲染（不依赖系统 LaTeX）。
+    display=True 时用 \displaystyle 增大公式风格。
+    """
+    latex = latex.strip()
+    if display:
+        expr = r"$\displaystyle " + latex + r"$"
+    else:
+        expr = r"$" + latex + r"$"
+
+    fig = plt.figure(figsize=(0.01, 0.01), dpi=dpi)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    t = ax.text(0, 0, expr, fontsize=font_size)
+
+    # draw to get bbox
+    fig.canvas.draw()
+    bbox = t.get_window_extent(renderer=fig.canvas.get_renderer()).expanded(1.10, 1.25)
+
+    # set figure size to bbox
+    w_in = bbox.width / dpi
+    h_in = bbox.height / dpi
+    fig.set_size_inches(w_in, h_in)
+
+    # reposition text
+    ax.cla()
+    ax.axis("off")
+    ax.text(0, 0, expr, fontsize=font_size)
+
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    out.seek(0)
+    return out
+
+
+# -------------------------
+# 4) 生成 DOCX（公式“渲染后插入原位”）
+# -------------------------
+def set_doc_style(doc: Document):
+    # Page margins
+    sec = doc.sections[0]
+    sec.top_margin = Cm(2.0)
+    sec.bottom_margin = Cm(2.0)
+    sec.left_margin = Cm(2.0)
+    sec.right_margin = Cm(2.0)
+
+    # Normal style: 中文宋体 + 英文 Times
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(11)
+    r = style._element.rPr.rFonts
+    r.set(qn("w:eastAsia"), "宋体")
+
+def add_text_with_inline_math(paragraph, text: str):
+    # 保留换行：把段内 \n 拆成多个 run / 新段落
+    lines = text.split("\n")
+    for li, line in enumerate(lines):
+        chunks = split_inline_math(line)
+        for kind, content in chunks:
+            if kind == "text":
+                paragraph.add_run(content)
+            else:
+                # inline math -> render png and insert as inline picture
+                try:
+                    img_stream = render_latex_png(content, display=False, font_size=13)
+                    run = paragraph.add_run()
+                    run.add_picture(img_stream, height=Pt(14))  # 行内高度
+                except Exception:
+                    paragraph.add_run(f"${content}$")  # fallback
+        if li != len(lines) - 1:
+            paragraph.add_run("\n")
+
+
+def add_display_equation(doc: Document, latex: str):
+    latex, tag = extract_tag(latex)
+
+    # 用两列表格实现“居中公式 + 右侧编号”
+    if tag:
+        table = doc.add_table(rows=1, cols=2)
+        table.style = "Table Normal"
+        left = table.cell(0, 0)
+        right = table.cell(0, 1)
+
+        # left: centered equation image
+        p_left = left.paragraphs[0]
+        p_left.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        try:
+            img_stream = render_latex_png(latex, display=True, font_size=16)
+            run = p_left.add_run()
+            run.add_picture(img_stream, height=Pt(28))
+        except Exception:
+            p_left.add_run(f"$$\n{latex}\n$$")
+
+        # right: equation number
+        p_right = right.paragraphs[0]
+        p_right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p_right.add_run(tag)
+
+        # spacing after table
+        doc.add_paragraph("")
+    else:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        try:
+            img_stream = render_latex_png(latex, display=True, font_size=16)
+            run = p.add_run()
+            run.add_picture(img_stream, height=Pt(28))
+        except Exception:
+            p.add_run(f"$$\n{latex}\n$$")
+
+
+def build_docx_from_markdown(md_text: str) -> bytes:
+    doc = Document()
+    set_doc_style(doc)
+
+    blocks = split_markdown_blocks(md_text)
+
+    for b in blocks:
+        if b.kind == "heading":
+            # level 1~3 用 heading，其他用加粗段落
+            lvl = min(max(b.level, 1), 3)
+            h = doc.add_heading(b.text, level=lvl)
+            # 中文字体更美观
+            for r in h.runs:
+                r.font.name = "Times New Roman"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+        elif b.kind == "ul":
+            p = doc.add_paragraph(style="List Bullet")
+            add_text_with_inline_math(p, b.text)
+        elif b.kind == "ol":
+            p = doc.add_paragraph(style="List Number")
+            add_text_with_inline_math(p, b.text)
+        elif b.kind == "display_math":
+            add_display_equation(doc, b.text)
+        else:  # para
+            p = doc.add_paragraph()
+            add_text_with_inline_math(p, b.text)
+
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+# -------------------------
+# 5) Streamlit UI（中文更美观）
+# -------------------------
+st.set_page_config(page_title="图片 OCR → Word(含公式渲染)", layout="wide")
+st.title("图片 OCR（Gemini）→ Word 文档（公式渲染后原位插入）")
 
 st.markdown(
-    "Upload an image. The app returns **Markdown** with formulas as **LaTeX** using `$...$` / `$$...$$`, "
-    "and renders it **in the original position** via MathJax."
+    "上传图片后，系统会识别**中文正文 + 数学公式**，公式用 LaTeX 表达并**渲染后插入到 Word(.docx)** 的原本位置（行内/独立公式）。"
 )
 
-colA, colB = st.columns([1, 1])
-
-with colA:
-    uploaded = st.file_uploader("Upload image (png/jpg/webp)", type=["png", "jpg", "jpeg", "webp"])
+col1, col2 = st.columns([1, 1])
+with col1:
+    uploaded = st.file_uploader("上传图片（png/jpg/webp）", type=["png", "jpg", "jpeg", "webp"])
     model_id = st.selectbox(
-        "Gemini model",
+        "选择模型（Flash 更快，Pro 更稳）",
         options=["gemini-3-flash-preview", "gemini-3-pro-preview"],
         index=0,
-        help="Flash is faster; Pro is typically more accurate for messy scans."
     )
-
-with colB:
-    st.info("Tip: If inline math doesn’t render in Streamlit markdown, this app uses MathJax HTML rendering to keep formulas in-place.")
+with col2:
+    st.info("提示：图片太大时可下采样，速度会明显提升；公式渲染会在导出 Word 时完成。")
 
 if not uploaded:
     st.stop()
 
 img = Image.open(uploaded).convert("RGB")
-st.image(img, caption="Uploaded image", use_container_width=True)
+st.image(img, caption="已上传图片", use_container_width=True)
 
-# Optional downscale for speed
-max_side = st.slider("Max side length (downscale if larger)", 800, 3000, 1800, 50)
+max_side = st.slider("最大边长（超过则下采样）", 800, 3500, 2000, 50)
 w, h = img.size
 scale = min(1.0, max_side / max(w, h))
 if scale < 1.0:
     img = img.resize((int(w * scale), int(h * scale)))
 
-# Encode to bytes (PNG)
-import io
 buf = io.BytesIO()
 img.save(buf, format="PNG")
 image_bytes = buf.getvalue()
 mime_type = "image/png"
 
-if st.button("Run OCR", type="primary"):
-    with st.spinner("Calling Gemini ..."):
+if st.button("开始识别", type="primary"):
+    with st.spinner("Gemini 识别中..."):
         md_out = gemini_ocr_markdown(image_bytes, mime_type, model_id)
 
-    tab1, tab2 = st.tabs(["Rendered (MathJax, in-place)", "Raw Markdown"])
+    st.subheader("识别结果（Markdown + LaTeX）")
+    st.code(md_out, language="markdown")
 
-    with tab1:
-        html_body = markdown_to_safe_html(md_out)
-        full_html = wrap_with_mathjax(html_body)
-        st.components.v1.html(full_html, height=800, scrolling=True)
+    with st.spinner("生成 Word(.docx)：渲染公式并原位插入..."):
+        docx_bytes = build_docx_from_markdown(md_out)
 
-    with tab2:
-        st.code(md_out, language="markdown")
-
-    st.download_button("Download Markdown", md_out.encode("utf-8"), file_name="result.md")
-    st.download_button("Download HTML", full_html.encode("utf-8"), file_name="result.html")
+    st.success("已生成 Word 文档（含渲染后的公式）。")
+    st.download_button("下载 result.docx", data=docx_bytes, file_name="result.docx")
+    st.download_button("下载 result.md", data=md_out.encode("utf-8"), file_name="result.md")
