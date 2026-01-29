@@ -531,6 +531,12 @@ def gemini_translate_items(
     src_lang: str,
     dst_lang: str,
 ) -> Dict[str, List[str]]:
+    """
+    items: [{"id":"p1","segments":[...]}]
+    return mapping id -> translated segments
+    """
+
+    # Build prompt (avoid .format to prevent {equation} KeyError)
     prompt = (TRANSLATE_PROMPT_TEMPLATE
               .replace("__SRC_LANG__", src_lang)
               .replace("__DST_LANG__", dst_lang))
@@ -538,38 +544,67 @@ def gemini_translate_items(
     payload = {"items": items}
 
     cfg = types.GenerateContentConfig(
-    temperature=0.2,
-    max_output_tokens=8192,
-    response_mime_type="application/json",
-)
+        temperature=0.2,
+        max_output_tokens=8192,
+        response_mime_type="application/json",
+    )
 
-    res = safe_generate(client, model, [prompt, json.dumps(payload, ensure_ascii=False)], cfg)
+    res = safe_generate(
+        client,
+        model,
+        [prompt, json.dumps(payload, ensure_ascii=False)],
+        cfg,
+    )
 
+    # 1) API-level error (429/401/400...)
     if res.error_message:
         st.error(f"Gemini translate error\nstatus={res.status_code}\n\n{res.error_message}")
 
-        if res.status_code == 429 and ("PerDayPerProjectPerModel-FreeTier" in res.error_message
-                                       or "generate_content_free_tier_requests" in res.error_message):
+        if res.status_code == 429 and (
+            "PerDayPerProjectPerModel-FreeTier" in res.error_message
+            or "generate_content_free_tier_requests" in res.error_message
+        ):
             st.warning(
                 "这是 Free Tier 的“每日请求数”配额用完了（不是临时限流）。\n"
                 "解决：1) 换模型（每个模型单独计数） 2) 换项目/API Key 3) 开通 Billing 4) 等到配额刷新。"
             )
         elif res.status_code == 429:
-            st.info("这是临时限流/配额，程序会自动等待重试；若仍失败，请降低切片数量或增大翻译批次以减少请求次数。")
+            st.info(
+                "这是临时限流/配额：代码会按 retryDelay 自动等待重试；若仍失败，请减少请求次数（减少 batch 数、增大 batch_chars）。"
+            )
 
-        try:
-    obj = extract_json_object(res.text)
-except Exception as e:
-    st.error(f"JSON parse failed: {e}")
-    st.markdown("#### Raw model output (first 2000 chars)")
-    st.code((res.text or "")[:2000], language="text")
-    st.stop()
+        st.stop()
 
+    # 2) JSON parse (model returned non-JSON / broken JSON / fenced block / truncated)
+    try:
+        obj = extract_json_object(res.text)
+    except Exception as e:
+        st.error(f"JSON parse failed: {e}")
+        st.markdown("#### Raw model output (first 2000 chars)")
+        st.code((res.text or "")[:2000], language="text")
+        st.stop()
 
-    obj = extract_json_object(res.text)
+    # 3) Build id -> segments mapping
     out: Dict[str, List[str]] = {}
-    for it in obj.get("items", []):
-        out[it["id"]] = it["segments"]
+    items_out = obj.get("items", [])
+    if not isinstance(items_out, list):
+        st.error("JSON schema error: expected obj['items'] to be a list.")
+        st.code(json.dumps(obj, ensure_ascii=False, indent=2)[:2000], language="json")
+        st.stop()
+
+    for it in items_out:
+        try:
+            _id = it["id"]
+            _segs = it["segments"]
+            if not isinstance(_segs, list):
+                raise ValueError("segments is not a list")
+            out[_id] = _segs
+        except Exception:
+            # show the bad item for debugging
+            st.error("JSON item schema error (expected {'id':..., 'segments':[...]}). Bad item:")
+            st.code(json.dumps(it, ensure_ascii=False, indent=2)[:2000], language="json")
+            st.stop()
+
     return out
 
 
