@@ -467,14 +467,62 @@ def chunk_items_for_api(items: List[dict], max_chars: int = 12000) -> List[List[
     return batches
 
 def extract_json_object(text: str) -> dict:
-    # robust: find first '{' and last '}' and parse
+    """
+    Robust JSON extraction:
+    1) If model returns ```json ... ```, strip fences
+    2) Try direct json.loads
+    3) Fallback: locate the first JSON object and parse with bracket matching
+    """
     if not text:
         raise ValueError("empty response")
-    a = text.find("{")
-    b = text.rfind("}")
-    if a == -1 or b == -1 or b <= a:
-        raise ValueError("no json braces found")
-    return json.loads(text[a:b+1])
+
+    s = text.strip()
+
+    # 1) Strip fenced code blocks
+    # e.g. ```json\n{...}\n```
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        s = fence.group(1).strip()
+
+    # 2) Try direct parse first
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 3) Bracket-matching to find first valid JSON object
+    start = s.find("{")
+    if start == -1:
+        raise ValueError("no '{' found in response")
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i+1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception as e:
+                        raise ValueError(f"json parse failed after bracket match: {e}\nCandidate:\n{candidate[:800]}")
+
+    raise ValueError("no complete JSON object found (unbalanced braces)")
+
 
 def gemini_translate_items(
     client: genai.Client,
@@ -490,9 +538,11 @@ def gemini_translate_items(
     payload = {"items": items}
 
     cfg = types.GenerateContentConfig(
-        temperature=0.2,
-        max_output_tokens=8192,
-    )
+    temperature=0.2,
+    max_output_tokens=8192,
+    response_mime_type="application/json",
+)
+
     res = safe_generate(client, model, [prompt, json.dumps(payload, ensure_ascii=False)], cfg)
 
     if res.error_message:
@@ -507,7 +557,14 @@ def gemini_translate_items(
         elif res.status_code == 429:
             st.info("这是临时限流/配额，程序会自动等待重试；若仍失败，请降低切片数量或增大翻译批次以减少请求次数。")
 
-        st.stop()
+        try:
+    obj = extract_json_object(res.text)
+except Exception as e:
+    st.error(f"JSON parse failed: {e}")
+    st.markdown("#### Raw model output (first 2000 chars)")
+    st.code((res.text or "")[:2000], language="text")
+    st.stop()
+
 
     obj = extract_json_object(res.text)
     out: Dict[str, List[str]] = {}
