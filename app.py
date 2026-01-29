@@ -23,7 +23,15 @@ from google.genai import errors as genai_errors
 
 # Pandoc
 import pypandoc
-import pypandoc_binary  # noqa: F401  (ensures pandoc is available)
+def ensure_pandoc():
+    try:
+        _ = pypandoc.get_pandoc_path()
+    except OSError:
+        # 若环境里没找到 pandoc，就尝试下载（某些云环境可能被限制）
+        pypandoc.download_pandoc()
+
+ensure_pandoc()
+
 
 # -----------------------------
 # UI basics
