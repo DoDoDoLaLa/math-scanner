@@ -110,14 +110,67 @@ def get_gemini_client() -> genai.Client:
     return genai.Client(api_key=get_api_key(), http_options=types.HttpOptions(api_version="v1beta"))
 
 
-def safe_generate(client: genai.Client, model: str, contents, config: Optional[types.GenerateContentConfig] = None) -> GeminiResult:
-    try:
-        resp = client.models.generate_content(model=model, contents=contents, config=config)
-        return GeminiResult(text=(resp.text or "").strip())
-    except genai_errors.ClientError as e:
-        return GeminiResult(text="", status_code=getattr(e, "status_code", None), error_message=str(e))
-    except Exception as e:
-        return GeminiResult(text="", status_code=None, error_message=f"{type(e).__name__}: {e}")
+def _parse_retry_delay_seconds(msg: str) -> Optional[float]:
+    # Examples:
+    # "Please retry in 37.161915127s."
+    m = re.search(r"retry in ([0-9.]+)s", msg)
+    if m:
+        return float(m.group(1))
+    # Sometimes includes JSON-like '"retryDelay":"37s"'
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+)s"', msg)
+    if m:
+        return float(m.group(1))
+    return None
+
+def _is_free_tier_daily_quota(msg: str) -> bool:
+    # daily quota strings often include:
+    # GenerateRequestsPerDayPerProjectPerModel-FreeTier
+    return ("PerDayPerProjectPerModel-FreeTier" in msg
+            or "generate_content_free_tier_requests" in msg)
+
+def safe_generate(
+    client: genai.Client,
+    model: str,
+    contents,
+    config: Optional[types.GenerateContentConfig] = None,
+    retries: int = 6,
+) -> GeminiResult:
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents, config=config)
+            return GeminiResult(text=(resp.text or "").strip())
+        except genai_errors.ClientError as e:
+            msg = str(e)
+            code = getattr(e, "status_code", None)
+
+            # 429: quota / rate limit
+            if code == 429 or "RESOURCE_EXHAUSTED" in msg or "Quota exceeded" in msg:
+                # 如果是 free tier 的“每日配额已用完”，等多久都没用
+                if _is_free_tier_daily_quota(msg):
+                    return GeminiResult(text="", status_code=429, error_message=msg)
+
+                # 否则按 retryDelay 等待并重试
+                wait_s = _parse_retry_delay_seconds(msg)
+                if wait_s is None:
+                    wait_s = min(2 ** attempt, 60)
+                time.sleep(min(wait_s + 0.3, 90.0))
+                last_err = (code, msg)
+                continue
+
+            return GeminiResult(text="", status_code=code, error_message=msg)
+
+        except genai_errors.ServerError as e:
+            last_err = ("5xx", str(e))
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        except Exception as e:
+            last_err = ("unknown", f"{type(e).__name__}: {e}")
+            time.sleep(min(2 ** attempt, 30))
+            continue
+
+    return GeminiResult(text="", status_code=None, error_message=f"retry exhausted: {last_err}")
+
 
 
 # =========================
@@ -445,8 +498,22 @@ def gemini_translate_items(
         max_output_tokens=8192,
     )
     res = safe_generate(client, model, [prompt, json.dumps(payload, ensure_ascii=False)], cfg)
-    if res.error_message:
-        raise RuntimeError(f"Gemini translate error: status={res.status_code} msg={res.error_message}")
+
+if res.error_message:
+    st.error(f"Gemini translate error\nstatus={res.status_code}\n\n{res.error_message}")
+
+    # 给出一条“能直接行动”的建议
+    if res.status_code == 429 and ("PerDayPerProjectPerModel-FreeTier" in res.error_message
+                                   or "generate_content_free_tier_requests" in res.error_message):
+        st.warning(
+            "这是 Free Tier 的“每日请求数”配额用完了（不是临时限流）。\n"
+            "解决：1) 换一个模型（每个模型单独计数） 2) 换项目/API Key 3) 开通 Billing 4) 等到配额刷新。"
+        )
+    elif res.status_code == 429:
+        st.info("这是临时限流/配额，程序会自动等待重试；若仍失败，请降低切片数量或增大翻译批次以减少请求次数。")
+
+    st.stop()
+
 
     obj = extract_json_object(res.text)
     out: Dict[str, List[str]] = {}
