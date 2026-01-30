@@ -235,7 +235,16 @@ def dedupe_tail_head(prev: str, cur: str, max_lines: int = 18) -> str:
     return cur
 
 
-def ocr_image_to_markdown(client: genai.Client, model: str, img: Image.Image, max_side: int, tile_h: int, overlap: int, jpeg_q: int, out_tokens: int) -> str:
+def ocr_image_to_markdown(
+    client: genai.Client,
+    model: str,
+    img: Image.Image,
+    max_side: int,
+    tile_h: int,
+    overlap: int,
+    jpeg_q: int,
+    out_tokens: int,
+) -> str:
     img = downscale(img, max_side=max_side)
     tiles = slice_long(img, tile_h=tile_h, overlap=overlap)
 
@@ -256,9 +265,16 @@ def ocr_image_to_markdown(client: genai.Client, model: str, img: Image.Image, ma
             contents = [part, OCR_PROMPT_ZH]
 
         cfg = types.GenerateContentConfig(temperature=1.0, max_output_tokens=out_tokens)
-        res = safe_generate(client, model, contents, cfg)
-        if res.error_message:
-            raise RuntimeError(f"Gemini OCR error: status={res.status_code} msg={res.error_message}")
+        
+        # Safe call with better error handling
+        try:
+            res = safe_generate(client, model, contents, cfg)
+            if res.error_message:
+                st.error(f"Gemini OCR error\nstatus={res.status_code}\n\n{res.error_message}")
+                st.stop()  # Stop further execution and display error to the user
+        except Exception as e:
+            st.error(f"Error during OCR: {str(e)}")
+            st.stop()  # Stop further execution on failure
 
         md = normalize_md(res.text)
         if chunks:
@@ -266,6 +282,7 @@ def ocr_image_to_markdown(client: genai.Client, model: str, img: Image.Image, ma
         chunks.append(md)
 
     return normalize_md("\n\n".join([c for c in chunks if c.strip()]))
+
 
 
 # =========================
