@@ -10,7 +10,7 @@ import base64
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
 
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
@@ -25,6 +25,13 @@ from docx.oxml.ns import qn
 
 import pypandoc
 
+# PDF rendering (optional but recommended)
+try:
+    import fitz  # PyMuPDF
+    HAVE_PYMUPDF = True
+except Exception:
+    HAVE_PYMUPDF = False
+
 
 # ============================================================
 # 0) App UI
@@ -33,7 +40,7 @@ st.set_page_config(page_title="Ark OCR / DOCX Translate / LaTeX Export", layout=
 st.title("学术 OCR & Word→LaTeX 工具（Ark EP 已接入）")
 
 st.caption(
-    "面向论文/讲义/教材：图片OCR→Markdown/Word；Word（含可编辑公式）→LaTeX/Markdown；Word 原排版内翻译（best-effort）。"
+    "面向论文/讲义/教材：PDF/图片OCR→Markdown/Word；Word（含可编辑公式）→LaTeX/Markdown；Word 原排版内翻译（best-effort）。"
 )
 
 def ensure_pandoc():
@@ -85,7 +92,7 @@ class ArkResult:
     error_message: Optional[str] = None
 
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"   # ✅ 你的 EP
+DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"
 DEFAULT_OCR_TIMEOUT_S = 120
 DEFAULT_TRANSLATE_TIMEOUT_S = 180
 
@@ -132,7 +139,6 @@ def get_timeout_defaults() -> Tuple[int, int]:
 
 @st.cache_resource(show_spinner=False)
 def get_ark_client_cached(api_key: str, base_url: str, default_timeout_s: int) -> OpenAI:
-    # ✅ 全局复用 + cache（Key/BaseURL/timeout 改变会自动重建）
     return OpenAI(api_key=api_key, base_url=base_url, timeout=default_timeout_s)
 
 def get_ark_client(default_timeout_s: int) -> OpenAI:
@@ -164,7 +170,7 @@ def safe_chat_completions(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                timeout=timeout_s,  # ✅ 请求级超时
+                timeout=timeout_s,
             )
             txt = ""
             if resp and resp.choices and resp.choices[0].message and resp.choices[0].message.content:
@@ -188,25 +194,16 @@ def safe_chat_completions(
 # 3) OCR: image analysis + auto recommend
 # ============================================================
 def analyze_image_density(img: Image.Image) -> Dict[str, float]:
-    """
-    粗略估计“文字密度/边缘密度”：用于推荐切片和分辨率参数。
-    - edge_density: 边缘像素比例（论文/表格/公式通常更高）
-    - dark_ratio: 暗像素比例（文字多通常更高）
-    """
     g = ImageOps.grayscale(img)
-    # 统一缩小到可控尺寸做分析（不影响 OCR 用原图）
     g_small = g.copy()
     g_small.thumbnail((900, 900))
     w, h = g_small.size
 
-    # 边缘
     edges = g_small.filter(ImageFilter.FIND_EDGES)
-    # 将边缘图二值化
     eb = edges.point(lambda p: 255 if p > 40 else 0)
     edge_px = sum(1 for p in eb.getdata() if p > 0)
     edge_density = edge_px / float(w * h + 1e-9)
 
-    # 暗像素（粗阈值）
     db = g_small.point(lambda p: 1 if p < 160 else 0)
     dark_px = sum(db.getdata())
     dark_ratio = dark_px / float(w * h + 1e-9)
@@ -214,71 +211,46 @@ def analyze_image_density(img: Image.Image) -> Dict[str, float]:
     return {"edge_density": edge_density, "dark_ratio": dark_ratio, "w": float(img.size[0]), "h": float(img.size[1])}
 
 def recommend_ocr_params(img: Image.Image, mode: str = "Balanced") -> Dict[str, int]:
-    """
-    mode: Fast / Balanced / Accurate
-    返回：max_side, tile_h, overlap, jpeg_q, out_tokens
-    """
     m = analyze_image_density(img)
-    w, h = int(m["w"]), int(m["h"])
+    h = int(m["h"])
     edge = m["edge_density"]
     dark = m["dark_ratio"]
-
-    # 复杂度评分：越大说明越“密排/公式表格多”
     complexity = 0.6 * edge + 0.4 * dark
 
-    # 基础参数
     if mode == "Fast":
-        max_side = 1600
-        jpeg_q = 80
-        out_tokens = 3072
-        base_tile = 2000
-        base_overlap = 120
+        max_side, jpeg_q, out_tokens = 1600, 80, 3072
+        base_tile, base_overlap = 2000, 120
     elif mode == "Accurate":
-        max_side = 2800
-        jpeg_q = 90
-        out_tokens = 6144
-        base_tile = 1400
-        base_overlap = 220
-    else:  # Balanced
-        max_side = 2200
-        jpeg_q = 85
-        out_tokens = 4096
-        base_tile = 1600
-        base_overlap = 160
+        max_side, jpeg_q, out_tokens = 2800, 90, 6144
+        base_tile, base_overlap = 1400, 220
+    else:
+        max_side, jpeg_q, out_tokens = 2200, 85, 4096
+        base_tile, base_overlap = 1600, 160
 
-    # 根据复杂度调整
-    if complexity > 0.18:         # 非常密排/表格多
+    if complexity > 0.18:
         max_side = min(3200, max_side + 400)
         out_tokens = min(8192, out_tokens + 1024)
         tile_h = max(1000, base_tile - 300)
         overlap = min(320, base_overlap + 80)
         jpeg_q = min(95, jpeg_q + 5)
-    elif complexity < 0.10:       # 较稀疏/字较大
+    elif complexity < 0.10:
         tile_h = min(2400, base_tile + 300)
         overlap = max(80, base_overlap - 40)
     else:
         tile_h = base_tile
         overlap = base_overlap
 
-    # 根据高度决定切片策略
     if h >= 4000 and complexity > 0.14:
         tile_h = max(900, tile_h - 200)
         out_tokens = min(8192, out_tokens + 512)
 
-    # clamp
     max_side = int(max(800, min(3200, max_side)))
     tile_h = int(max(800, min(2600, tile_h)))
     overlap = int(max(0, min(400, overlap)))
     jpeg_q = int(max(50, min(95, jpeg_q)))
     out_tokens = int(max(1024, min(8192, out_tokens)))
 
-    return {
-        "max_side": max_side,
-        "tile_h": tile_h,
-        "overlap": overlap,
-        "jpeg_q": jpeg_q,
-        "out_tokens": out_tokens,
-    }
+    return {"max_side": max_side, "tile_h": tile_h, "overlap": overlap, "jpeg_q": jpeg_q, "out_tokens": out_tokens}
 
 
 # ============================================================
@@ -396,6 +368,25 @@ def ocr_image_to_markdown(
 
 
 # ============================================================
+# 4.5) PDF -> images (PyMuPDF)
+# ============================================================
+def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = None) -> List[Image.Image]:
+    if not HAVE_PYMUPDF:
+        raise RuntimeError("缺少依赖 pymupdf。请先 pip install pymupdf")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    imgs: List[Image.Image] = []
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    n = doc.page_count if max_pages is None else min(doc.page_count, max_pages)
+    for i in range(n):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        imgs.append(img)
+    return imgs
+
+
+# ============================================================
 # 5) LaTeX code style for OCR result
 # ============================================================
 DISPLAY_MATH_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
@@ -456,18 +447,47 @@ def iter_table_paragraphs(table: Table) -> List[Paragraph]:
                 out.extend(iter_table_paragraphs(t2))
     return out
 
-def iter_all_paragraphs(doc: Document) -> List[Paragraph]:
+def iter_part_paragraphs(part) -> List[Paragraph]:
+    """part: doc, header, footer"""
     ps: List[Paragraph] = []
-    ps.extend(doc.paragraphs)
-    for table in doc.tables:
-        ps.extend(iter_table_paragraphs(table))
+    try:
+        ps.extend(part.paragraphs)
+    except Exception:
+        pass
+    try:
+        for table in part.tables:
+            ps.extend(iter_table_paragraphs(table))
+    except Exception:
+        pass
+    return ps
+
+def iter_all_paragraphs_extended(doc: Document) -> List[Paragraph]:
+    """
+    ✅ 覆盖：正文 paragraphs + tables + 每个 section 的 header/footer（含表格）
+    仍不覆盖：textbox/shape、批注、脚注尾注（python-docx 限制）
+    """
+    ps: List[Paragraph] = []
+    ps.extend(iter_part_paragraphs(doc))
+
+    # headers/footers
+    try:
+        for sec in doc.sections:
+            ps.extend(iter_part_paragraphs(sec.header))
+            ps.extend(iter_part_paragraphs(sec.footer))
+            # first/even page headers/footers（若存在）
+            if hasattr(sec, "first_page_header"):
+                ps.extend(iter_part_paragraphs(sec.first_page_header))
+            if hasattr(sec, "first_page_footer"):
+                ps.extend(iter_part_paragraphs(sec.first_page_footer))
+            if hasattr(sec, "even_page_header"):
+                ps.extend(iter_part_paragraphs(sec.even_page_header))
+            if hasattr(sec, "even_page_footer"):
+                ps.extend(iter_part_paragraphs(sec.even_page_footer))
+    except Exception:
+        pass
     return ps
 
 def extract_math_from_docx_with_pandoc(docx_bytes: bytes) -> List[Tuple[str, str]]:
-    """
-    best-effort：用 pandoc 抽取 markdown 里的 $...$/$$...$$ 序列
-    仍可能与 docx 内 oMath 遍历顺序不一致 —— 所以这里只用于“就地替换”模式。
-    """
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         f = td / "in.docx"
@@ -493,7 +513,7 @@ def insert_text_run_at_paragraph_child(p_elm, idx: int, text: str):
     p_elm.insert(idx, r)
 
 def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]], use_equation_env: bool = True) -> int:
-    all_ps = iter_all_paragraphs(doc)
+    all_ps = iter_all_paragraphs_extended(doc)
     seq_idx = 0
     replaced = 0
 
@@ -629,6 +649,21 @@ def doubao_translate_items(
         out[it["id"]] = it["segments"]
     return out
 
+def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min: int = 4000, clamp_max: int = 20000) -> int:
+    """
+    自动分批大小：
+    - 先估 total_json_chars
+    - 再除以 target_batches 得到 max_batch_chars
+    - clamp 到 [clamp_min, clamp_max]
+    """
+    if not items:
+        return 12000
+    total = 0
+    for it in items:
+        total += len(json.dumps(it, ensure_ascii=False))
+    est = int(total / max(1, target_batches))
+    return int(max(clamp_min, min(clamp_max, est)))
+
 def translate_docx_in_place(
     doc: Document,
     client: OpenAI,
@@ -638,12 +673,16 @@ def translate_docx_in_place(
     max_batch_chars: int,
     timeout_s: int,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    diagnostic_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ):
-    all_ps = iter_all_paragraphs(doc)
+    all_ps = iter_all_paragraphs_extended(doc)
 
-    items = []
-    para_refs = {}
+    items: List[dict] = []
+    para_refs: Dict[str, Tuple[List[Any], List[Dict[str, str]]]] = {}
     pid = 0
+
+    total_runs = 0
+    total_visible_chars = 0
 
     for p in all_ps:
         runs = [r for r in p.runs if r.text is not None and r.text != ""]
@@ -653,6 +692,8 @@ def translate_docx_in_place(
         segs = []
         maps = []
         for r in runs:
+            total_runs += 1
+            total_visible_chars += len(r.text or "")
             protected, mp = protect_math(r.text)
             segs.append(protected)
             maps.append(mp)
@@ -664,6 +705,28 @@ def translate_docx_in_place(
         item_id = f"p{pid}"
         items.append({"id": item_id, "segments": segs})
         para_refs[item_id] = (runs, maps)
+
+    if diagnostic_cb is not None:
+        diagnostic_cb({
+            "paragraphs_scanned": len(all_ps),
+            "items_built": len(items),
+            "runs_counted": total_runs,
+            "visible_chars_counted": total_visible_chars,
+        })
+
+    if not items:
+        # 关键：明确提示为什么“没有翻译”
+        st.warning(
+            "没有抓到可翻译的正文文本（items=0）。\n\n"
+            "常见原因：\n"
+            "1) 内容在文本框/形状（python-docx 默认无法读取）；\n"
+            "2) 内容主要在批注/脚注/尾注；\n"
+            "3) 内容是嵌入对象或图片。\n\n"
+            "建议：\n"
+            "- 若是文本框：优先用 Tab③ Pandoc 导出，或将文本框内容复制到正文段落后再翻译；\n"
+            "- 或改走 PDF/图片 OCR 路线。"
+        )
+        return
 
     batches = chunk_items_for_api(items, max_chars=max_batch_chars)
     total = len(batches)
@@ -739,7 +802,7 @@ def _init_state():
 
 _init_state()
 
-# ✅ 关键修复：在任何 widget（slider/number_input）创建之前应用 pending 推荐参数
+# ✅ 关键修复：在任何 widget 创建之前应用 pending 推荐参数
 if "__pending_rec__" in st.session_state:
     rec = st.session_state.pop("__pending_rec__")
     for k in ["max_side", "tile_h", "overlap", "jpeg_q", "out_tokens"]:
@@ -789,62 +852,101 @@ with st.sidebar:
 # 9) Tabs
 # ============================================================
 tabs = st.tabs([
-    "① 图片 OCR → 导出",
+    "① PDF/图片 OCR → 导出",
     "② Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
     "③ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
 ])
 
 # ---------------------------
-# Tab 1: OCR
+# Tab 1: OCR (PDF + images)
 # ---------------------------
 with tabs[0]:
-    st.subheader("图片 OCR（带自动参数推荐 + 进度条）")
-    st.write("建议：先上传 1 张代表性页面 → 点“自动推荐参数” → 再批量处理。")
+    st.subheader("PDF/图片 OCR（带自动参数推荐 + 进度条）")
+    st.write("建议：先上传 1 页代表性页面 → 点“自动推荐参数” → 再批量处理。")
 
-    # 一次性提示（来自 pending 推荐参数应用）
     if "__pending_rec_msg__" in st.session_state:
         st.success(st.session_state.pop("__pending_rec_msg__"))
 
-    imgs = st.file_uploader("上传图片（可多选）", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
+    files = st.file_uploader(
+        "上传 PDF 或图片（可多选，PDF 将按页渲染）",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True
+    )
+
+    col_pdf = st.columns([1, 1, 2])
+    with col_pdf[0]:
+        pdf_dpi = st.selectbox("PDF 渲染 DPI", [200, 300, 400], index=1)
+    with col_pdf[1]:
+        pdf_max_pages = st.number_input("PDF 最多页数（0=不限制）", min_value=0, max_value=500, value=0, step=1)
+    with col_pdf[2]:
+        if not HAVE_PYMUPDF:
+            st.warning("未检测到 pymupdf，PDF 上传不可用。请 pip install pymupdf")
+
+    # 先把所有输入转换成 images list
+    images: List[Image.Image] = []
+    page_meta: List[str] = []  # for page labeling
+
+    if files:
+        for f in files:
+            name = getattr(f, "name", "upload")
+            ext = (name.split(".")[-1] or "").lower()
+            if ext == "pdf":
+                if not HAVE_PYMUPDF:
+                    st.error("你上传了 PDF，但环境缺少 pymupdf。请安装后重试：pip install pymupdf")
+                    st.stop()
+                pdf_bytes = f.read()
+                try:
+                    imgs = pdf_bytes_to_images(
+                        pdf_bytes,
+                        dpi=int(pdf_dpi),
+                        max_pages=None if int(pdf_max_pages) == 0 else int(pdf_max_pages),
+                    )
+                except Exception as e:
+                    st.error(f"PDF 渲染失败：{e}")
+                    st.stop()
+                for i, im in enumerate(imgs, start=1):
+                    images.append(im)
+                    page_meta.append(f"{name} - p{i}")
+            else:
+                try:
+                    im = Image.open(f)
+                    images.append(im)
+                    page_meta.append(name)
+                except Exception as e:
+                    st.warning(f"无法读取图片 {name}：{e}")
 
     cols = st.columns([1, 1, 2])
     with cols[0]:
-        auto_btn = st.button("🪄 自动推荐参数（基于第1张图）", disabled=not imgs)
+        auto_btn = st.button("🪄 自动推荐参数（基于第1页）", disabled=not images)
     with cols[1]:
-        preset_btn = st.button("🎛️ 应用预设（Fast/Balanced/Accurate）", disabled=not imgs)
+        preset_btn = st.button("🎛️ 应用预设（Fast/Balanced/Accurate）", disabled=not images)
     with cols[2]:
         st.caption("自动推荐会根据图片高度与文字/边缘密度估计调整 max_side/tile/overlap/tokens。")
 
-    # ✅ 修复：不要直接 st.session_state['max_side']=...，改为 pending + rerun
-    if imgs and auto_btn:
-        img0 = Image.open(imgs[0])
-        rec = recommend_ocr_params(img0, mode=st.session_state["preset_mode"])
+    if images and auto_btn:
+        rec = recommend_ocr_params(images[0], mode=st.session_state["preset_mode"])
         st.session_state["__pending_rec__"] = rec
         st.rerun()
 
-    if imgs and preset_btn:
-        rec = recommend_ocr_params(Image.open(imgs[0]), mode=st.session_state["preset_mode"])
+    if images and preset_btn:
+        rec = recommend_ocr_params(images[0], mode=st.session_state["preset_mode"])
         st.session_state["__pending_rec__"] = rec
         st.rerun()
 
-    # 可选：合并“PDF 换行”
-    join_lines = st.checkbox("可选：合并断行（适合 PDF 每行强制换行的情况）", value=False,
-                             help="会把同段落中间的单换行合并为一个空格；保留空行分段。")
+    join_lines = st.checkbox("可选：合并断行（适合 PDF 每行强制换行）", value=False)
 
     def merge_hard_wraps(md: str) -> str:
-        # 简单规则：段内单换行合并，段间空行保留
         parts = md.split("\n\n")
         out = []
         for p in parts:
             lines = [x.strip() for x in p.splitlines()]
-            # 不处理列表/表格/标题块（保守）
             if any(l.startswith(("-", "*", "|", "#")) for l in lines):
                 out.append("\n".join(p.splitlines()))
             else:
                 out.append(" ".join([l for l in lines if l != ""]).strip())
         return "\n\n".join(out).strip()
 
-    if st.button("开始 OCR 并导出", type="primary", disabled=not imgs):
+    if st.button("开始 OCR 并导出", type="primary", disabled=not images):
         if not st.session_state["model_id"].strip():
             st.error("请先填写 model（ep-xxxx 或模型ID）。")
             st.stop()
@@ -852,11 +954,10 @@ with tabs[0]:
         client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
 
         pages = []
-        total_pages = len(imgs)
+        total_pages = len(images)
         page_bar = st.progress(0, text="准备 OCR…")
 
-        for pi, f in enumerate(imgs, start=1):
-            img = Image.open(f)
+        for pi, img in enumerate(images, start=1):
             tile_bar = st.progress(0, text=f"OCR 第 {pi}/{total_pages} 页：准备切片…")
 
             def _tile_cb(cur: int, total: int):
@@ -878,7 +979,8 @@ with tabs[0]:
             if join_lines:
                 md = merge_hard_wraps(md)
 
-            pages.append(f"## 第 {pi} 页\n\n{md}")
+            label = page_meta[pi - 1] if pi - 1 < len(page_meta) else f"Page {pi}"
+            pages.append(f"## 第 {pi} 页（{label}）\n\n{md}")
             page_bar.progress(int(pi / total_pages * 100), text=f"已完成 {pi}/{total_pages} 页")
             tile_bar.empty()
 
@@ -903,18 +1005,18 @@ with tabs[0]:
 
 
 # ---------------------------
-# Tab 2: DOCX in-place translate + best-effort equation replace
+# Tab 2: DOCX translate + best-effort equation replace
 # ---------------------------
 with tabs[1]:
-    st.subheader("Word(.docx) → 保排版翻译/就地替换公式（best-effort）")
+    st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
     st.warning(
-        "说明：Word 可编辑公式（OMML）要“可靠”转 LaTeX，推荐使用 Tab③ 的 Pandoc 直接导出。"
+        "说明：Word 可编辑公式（OMML）要“可靠”转 LaTeX，推荐使用 Tab③ 的 Pandoc 直接导出。\n"
         "本 Tab 的“就地替换公式”为 best-effort，可能出现错位/不全。"
     )
 
     docx_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_inplace")
 
-    colA, colB = st.columns([1, 1])
+    colA, colB, colC = st.columns([1, 1, 1])
     with colA:
         do_equation_replace = st.checkbox("把 Word 原生公式（OMML）替换为 LaTeX 代码（best-effort）", value=False)
         do_translate = st.checkbox("翻译文档（尽量保持原排版）", value=False)
@@ -922,7 +1024,17 @@ with tabs[1]:
     with colB:
         src_lang = st.selectbox("源语言", ["Auto", "Chinese", "English", "Japanese", "Korean", "Spanish"], index=0)
         dst_lang = st.selectbox("目标语言", ["Chinese", "English", "Japanese", "Korean", "Spanish"], index=1)
+
+    with colC:
+        auto_batch = st.checkbox("自动分批（推荐）", value=True)
+        target_batches = st.number_input("目标批次数（自动分批用）", min_value=1, max_value=50, value=8, step=1)
+
+    if not auto_batch:
         max_batch_chars = st.slider("翻译分批大小（max_batch_chars）", 4000, 20000, 12000, 500)
+    else:
+        max_batch_chars = 12000  # will be computed after parsing doc
+
+    show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
 
     if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
         if not st.session_state["model_id"].strip():
@@ -937,17 +1049,51 @@ with tabs[1]:
         if do_equation_replace:
             with st.spinner("提取公式序列（pandoc）..."):
                 math_seq = extract_math_from_docx_with_pandoc(doc_bytes)
-
             with st.spinner("替换 Word 原生公式为 LaTeX 代码（best-effort）..."):
                 replaced_count = replace_omml_with_latex_code(doc, math_seq, use_equation_env=True)
-
             st.info(f"已替换公式数量（best-effort）：{replaced_count}")
 
         if do_translate:
             batch_bar = st.progress(0, text="准备翻译…")
 
+            diag_box = st.empty()
+
             def _batch_cb(cur: int, total: int):
                 batch_bar.progress(int(cur / total * 100), text=f"翻译批次 {cur}/{total}")
+
+            diag_payload_holder: Dict[str, Any] = {}
+
+            def _diag_cb(payload: Dict[str, Any]):
+                diag_payload_holder.update(payload)
+
+            # 先“预扫描”一次 items 以便自动分批（不重复实现：直接在函数里回调诊断）
+            # 技巧：先调用一次 translate_docx_in_place 之前计算批大小 ——我们需要 items 列表。
+            # 为避免重写大量逻辑，这里用同一套构建逻辑再构建一次 items（轻量）。
+            all_ps = iter_all_paragraphs_extended(doc)
+            items_preview: List[dict] = []
+            pid = 0
+            for p in all_ps:
+                runs = [r for r in p.runs if r.text is not None and r.text != ""]
+                if not runs:
+                    continue
+                segs = []
+                for r in runs:
+                    protected, _ = protect_math(r.text)
+                    segs.append(protected)
+                if not "".join(segs).strip():
+                    continue
+                pid += 1
+                items_preview.append({"id": f"p{pid}", "segments": segs})
+
+            if auto_batch:
+                max_batch_chars = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
+                st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars}")
+
+            if show_translate_diagnostics:
+                diag_box.info(
+                    "诊断将在开始后显示：扫描段落数 / 可翻译 items 数 / runs 数 / 字符数。\n"
+                    "若 items=0，多半是内容在文本框/形状里（python-docx 读不到）。"
+                )
 
             with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
                 translate_docx_in_place(
@@ -959,6 +1105,16 @@ with tabs[1]:
                     max_batch_chars=int(max_batch_chars),
                     timeout_s=int(st.session_state["translate_timeout_s"]),
                     progress_cb=_batch_cb,
+                    diagnostic_cb=_diag_cb,
+                )
+
+            if show_translate_diagnostics and diag_payload_holder:
+                diag_box.success(
+                    f"翻译抓取诊断：\n"
+                    f"- paragraphs_scanned = {diag_payload_holder.get('paragraphs_scanned')}\n"
+                    f"- items_built       = {diag_payload_holder.get('items_built')}\n"
+                    f"- runs_counted      = {diag_payload_holder.get('runs_counted')}\n"
+                    f"- visible_chars     = {diag_payload_holder.get('visible_chars_counted')}\n"
                 )
 
         out_docx_bytes = doc_to_bytes(doc)
@@ -971,9 +1127,7 @@ with tabs[1]:
 # ---------------------------
 with tabs[2]:
     st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐：可编辑公式最稳）")
-    st.write(
-        "这个模式不追求保留 Word 的排版，而是追求“学术 LaTeX 输出的正确性”，尤其适合含大量可编辑公式的论文/作业。"
-    )
+    st.write("这个模式不追求保留 Word 排版，而追求“学术 LaTeX 输出正确性”，尤其适合大量可编辑公式。")
 
     docx_file2 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_export")
 
@@ -995,7 +1149,6 @@ with tabs[2]:
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="latex")
                 st.download_button("下载 .tex", data=out_text.encode("utf-8"), file_name="export.tex")
             else:
-                # markdown：尽量保留 tex_math_dollars
                 out_text = pypandoc.convert_file(str(in_path), to="markdown", format="docx", extra_args=extra_args)
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
                 st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
