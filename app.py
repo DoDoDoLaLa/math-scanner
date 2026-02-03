@@ -88,8 +88,11 @@ class ArkResult:
 def get_api_key() -> str:
     # Streamlit secrets 优先，其次环境变量
     k = None
-    if "ARK_API_KEY" in st.secrets:
-        k = st.secrets["ARK_API_KEY"]
+    try:
+        if "ARK_API_KEY" in st.secrets:
+            k = st.secrets["ARK_API_KEY"]
+    except Exception:
+        pass
     k = k or os.environ.get("ARK_API_KEY")
     if not k:
         st.error("缺少 ARK_API_KEY。请在 Streamlit Secrets 或环境变量中配置。")
@@ -99,8 +102,11 @@ def get_api_key() -> str:
 
 def get_ark_base_url() -> str:
     # 官方常用： https://ark.cn-beijing.volces.com/api/v3
-    return (st.secrets.get("ARK_BASE_URL", None) if hasattr(st, "secrets") else None) or \
-           os.environ.get("ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3"
+    try:
+        v = st.secrets.get("ARK_BASE_URL", None)
+    except Exception:
+        v = None
+    return v or os.environ.get("ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3"
 
 
 def get_ark_client() -> OpenAI:
@@ -109,11 +115,9 @@ def get_ark_client() -> OpenAI:
 
 
 def _parse_retry_delay_seconds(msg: str) -> Optional[float]:
-    # 兼容你原来的 regex： "Please retry in 37.16s"
     m = re.search(r"retry in ([0-9.]+)s", msg, flags=re.IGNORECASE)
     if m:
         return float(m.group(1))
-    # 或者 "retryDelay":"37s"
     m = re.search(r'"retryDelay"\s*:\s*"(\d+)s"', msg)
     if m:
         return float(m.group(1))
@@ -130,7 +134,9 @@ def safe_chat_completions(
 ) -> ArkResult:
     """
     使用 Ark(OpenAI-compatible) /chat/completions
-    model: 你的 Endpoint ID（ep-xxxx）或平台允许的模型标识（建议用 Endpoint ID）
+    model: 既可以是：
+      - 推理接入点 Endpoint ID（通常 ep- 开头）
+      - 也可以是模型 ID（例如：doubao-seed-1-8-251228）
     """
     last_err: Any = None
     for attempt in range(retries):
@@ -151,7 +157,6 @@ def safe_chat_completions(
             msg = f"{type(e).__name__}: {e}"
             last_err = msg
 
-            # 429/限流：尽量按 retryDelay 等待
             if "429" in msg or "rate limit" in msg.lower() or "RESOURCE_EXHAUSTED" in msg:
                 wait_s = _parse_retry_delay_seconds(msg)
                 if wait_s is None:
@@ -159,7 +164,6 @@ def safe_chat_completions(
                 time.sleep(min(wait_s + 0.3, 90.0))
                 continue
 
-            # 其他错误：指数退避少量重试
             time.sleep(min(2 ** attempt, 30))
 
     return ArkResult(text="", status_code=None, error_message=f"retry exhausted: {last_err}")
@@ -249,7 +253,6 @@ def ocr_image_to_markdown(
         b = pil_to_jpeg_bytes(timg, quality=jpeg_q)
         data_url = _jpeg_bytes_to_data_url(b)
 
-        # OpenAI-compatible multi-modal messages
         messages = [{
             "role": "user",
             "content": [
@@ -618,12 +621,12 @@ tabs = st.tabs(["① 图片 OCR → 导出", "② 上传 Word(.docx) → LaTeX �
 with st.sidebar:
     st.subheader("豆包/火山方舟设置")
 
-    # 这里改成 Endpoint ID（ep-xxx）。比固定模型名更稳。
+    # 关键改动：既支持 ep-xxxx，也支持 doubao-seed-1-8-251228
     model_id = st.text_input(
-        "Endpoint ID (model)",
-        value=os.environ.get("ARK_ENDPOINT_ID", ""),
-        placeholder="例如：ep-20260101xxxxxx",
-        help="在火山方舟控制台创建推理接入点后复制 Endpoint ID（通常以 ep- 开头）。"
+        "model（可填 ep- 推理接入点，也可填模型ID）",
+        value=os.environ.get("ARK_MODEL", os.environ.get("ARK_ENDPOINT_ID", "")),
+        placeholder="例如：doubao-seed-1-8-251228 或 ep-2026xxxx",
+        help="你截图里的 model 是 doubao-seed-1-8-251228；如果你创建了推理接入点，也可以填 ep-xxxx。"
     )
 
     st.caption(f"Base URL: {get_ark_base_url()}")
@@ -636,7 +639,7 @@ with st.sidebar:
     jpeg_q = st.slider("JPEG quality", 50, 95, 85, 1)
     out_tokens = st.slider("OCR max tokens", 1024, 8192, 4096, 256)
 
-    st.info("提示：第一次运行请先在左侧填好 Endpoint ID，否则无法调用。")
+    st.info("提示：请确认已配置 ARK_API_KEY；model 直接填 doubao-seed-1-8-251228 也可。")
 
 
 with tabs[0]:
@@ -645,7 +648,7 @@ with tabs[0]:
 
     if st.button("开始 OCR 并导出", type="primary", disabled=(not imgs)):
         if not model_id.strip():
-            st.error("请先在左侧填写 Endpoint ID（ep-xxxx）。")
+            st.error("请先在左侧填写 model（doubao-seed-1-8-251228 或 ep-xxxx）。")
             st.stop()
 
         client = get_ark_client()
@@ -662,7 +665,6 @@ with tabs[0]:
         st.markdown("### 预览（Markdown）")
         st.code(merged_md, language="markdown")
 
-        # ---- Export 3 versions ----
         v1_docx = pandoc_md_to_docx(merged_md)
         v2_md_bytes = merged_md.encode("utf-8")
         v3_md = md_to_latex_code_style(merged_md)
@@ -693,7 +695,7 @@ with tabs[1]:
 
     if st.button("开始处理并导出", type="primary", disabled=not docx_file):
         if not model_id.strip():
-            st.error("请先在左侧填写 Endpoint ID（ep-xxxx）。")
+            st.error("请先在左侧填写 model（doubao-seed-1-8-251228 或 ep-xxxx）。")
             st.stop()
 
         client = get_ark_client()
