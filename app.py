@@ -11,7 +11,7 @@ import tempfile
 import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
+from typing import Dict, List, Tuple, Optional, Any, Callable
 
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
@@ -97,6 +97,36 @@ DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"
 DEFAULT_OCR_TIMEOUT_S = 120
 DEFAULT_TRANSLATE_TIMEOUT_S = 180
 
+
+# ------------------------
+# debug / trace utilities
+# ------------------------
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+def make_realtime_logger(container: "st.delta_generator.DeltaGenerator", key: str = "__rtlog__", max_lines: int = 250):
+    """
+    实时日志：每次 log() 追加一行，并在 UI 中刷新。
+    保留最近 max_lines 行，避免撑爆页面。
+    """
+    if key not in st.session_state:
+        st.session_state[key] = []
+
+    def log(msg: str):
+        lines: List[str] = st.session_state.get(key, [])
+        lines.append(f"[{_ts()}] {msg}")
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        st.session_state[key] = lines
+        container.code("\n".join(lines), language="text")
+
+    def clear():
+        st.session_state[key] = []
+        container.code("", language="text")
+
+    return log, clear
+
+
 def get_api_key() -> str:
     k = None
     try:
@@ -140,6 +170,7 @@ def get_timeout_defaults() -> Tuple[int, int]:
 
 @st.cache_resource(show_spinner=False)
 def get_ark_client_cached(api_key: str, base_url: str, default_timeout_s: int) -> OpenAI:
+    # 这里 timeout 是 OpenAI SDK / httpx 的默认超时（单次请求）。
     return OpenAI(api_key=api_key, base_url=base_url, timeout=default_timeout_s)
 
 def get_ark_client(default_timeout_s: int) -> OpenAI:
@@ -153,6 +184,7 @@ def _parse_retry_delay_seconds(msg: str) -> Optional[float]:
     if m:
         return float(m.group(1))
     return None
+
 
 def safe_chat_completions(
     client: OpenAI,
@@ -179,13 +211,11 @@ def safe_chat_completions(
 
         if on_attempt:
             try:
-                on_attempt(attempt, retries, "request")
+                on_attempt(attempt, retries, "safe_chat_completions: request")
             except Exception:
                 pass
 
         try:
-            # 重要：某些环境里 http 超时/流控可能导致请求“看起来卡死”。
-            # 这里用线程包一层硬超时：即使底层库未按预期抛超时，我们也能继续重试并给出可见反馈。
             def _do_req():
                 return client.chat.completions.create(
                     model=model,
@@ -195,12 +225,21 @@ def safe_chat_completions(
                     timeout=timeout_s,
                 )
 
+            # 用线程包一层“硬超时”，避免某些环境底层卡死不抛异常
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(_do_req)
                 resp = fut.result(timeout=float(timeout_s) + 5.0)
+
             txt = ""
             if resp and resp.choices and resp.choices[0].message and resp.choices[0].message.content:
                 txt = resp.choices[0].message.content
+
+            if on_attempt:
+                try:
+                    on_attempt(attempt, retries, "safe_chat_completions: got response")
+                except Exception:
+                    pass
+
             return ArkResult(text=(txt or "").strip())
 
         except concurrent.futures.TimeoutError:
@@ -209,7 +248,7 @@ def safe_chat_completions(
             wait_s = min(2 ** (attempt - 1), 20)
             if on_attempt:
                 try:
-                    on_attempt(attempt, retries, f"request timeout, sleep {wait_s:.1f}s")
+                    on_attempt(attempt, retries, f"safe_chat_completions: request timeout, sleep {wait_s:.1f}s")
                 except Exception:
                     pass
             time.sleep(wait_s)
@@ -219,22 +258,20 @@ def safe_chat_completions(
             msg = f"{type(e).__name__}: {e}"
             last_err = msg
 
-            # 429 / 限流：按服务端提示或指数退避，但仍受 total_timeout_s 约束
             if ("429" in msg) or ("rate limit" in msg.lower()) or ("RESOURCE_EXHAUSTED" in msg):
                 wait_s = _parse_retry_delay_seconds(msg) or min(2 ** (attempt - 1), 60)
                 if on_attempt:
                     try:
-                        on_attempt(attempt, retries, f"rate-limited, sleep {wait_s:.1f}s")
+                        on_attempt(attempt, retries, f"safe_chat_completions: rate-limited, sleep {wait_s:.1f}s")
                     except Exception:
                         pass
                 time.sleep(min(wait_s + 0.3, 90.0))
                 continue
 
-            # 其它错误：短暂退避
             wait_s = min(2 ** (attempt - 1), 20)
             if on_attempt:
                 try:
-                    on_attempt(attempt, retries, f"error, sleep {wait_s:.1f}s")
+                    on_attempt(attempt, retries, f"safe_chat_completions: error, sleep {wait_s:.1f}s ({msg})")
                 except Exception:
                     pass
             time.sleep(wait_s)
@@ -500,7 +537,6 @@ def iter_table_paragraphs(table: Table) -> List[Paragraph]:
     return out
 
 def iter_part_paragraphs(part) -> List[Paragraph]:
-    """part: doc, header, footer"""
     ps: List[Paragraph] = []
     try:
         ps.extend(part.paragraphs)
@@ -514,19 +550,13 @@ def iter_part_paragraphs(part) -> List[Paragraph]:
     return ps
 
 def iter_all_paragraphs_extended(doc: Document) -> List[Paragraph]:
-    """
-    ✅ 覆盖：正文 paragraphs + tables + 每个 section 的 header/footer（含表格）
-    仍不覆盖：textbox/shape、批注、脚注尾注（python-docx 限制）
-    """
     ps: List[Paragraph] = []
     ps.extend(iter_part_paragraphs(doc))
 
-    # headers/footers
     try:
         for sec in doc.sections:
             ps.extend(iter_part_paragraphs(sec.header))
             ps.extend(iter_part_paragraphs(sec.footer))
-            # first/even page headers/footers（若存在）
             if hasattr(sec, "first_page_header"):
                 ps.extend(iter_part_paragraphs(sec.first_page_header))
             if hasattr(sec, "first_page_footer"):
@@ -672,14 +702,25 @@ def doubao_translate_items(
     src_lang: str,
     dst_lang: str,
     timeout_s: int,
-    on_attempt: Optional[Callable[[int, int, str], None]] = None,
+    debug_log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, List[str]]:
+    """
+    debug_log: 实时打印翻译内部阶段，定位卡在：请求/返回/JSON解析/结构异常
+    """
+    if debug_log:
+        debug_log(f"[doubao_translate_items] enter: items={len(items)}, timeout_s={timeout_s}")
+
     src = "auto-detect" if src_lang == "Auto" else src_lang
     prompt = (TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src).replace("__DST_LANG__", dst_lang))
 
     payload = {"items": items}
     messages = [{"role": "user", "content": prompt + "\n\n" + json.dumps(payload, ensure_ascii=False)}]
 
+    def _on_attempt(attempt_idx: int, retries: int, phase: str):
+        if debug_log:
+            debug_log(f"[safe_chat_completions] attempt {attempt_idx}/{retries}: {phase}")
+
+    t_req0 = time.time()
     res = safe_chat_completions(
         client=client,
         model=model,
@@ -689,28 +730,41 @@ def doubao_translate_items(
         timeout_s=timeout_s,
         retries=3,
         total_timeout_s=int(timeout_s) + 90,
-        on_attempt=on_attempt,
+        on_attempt=_on_attempt,
     )
+    t_req1 = time.time()
+
+    if debug_log:
+        debug_log(f"[doubao_translate_items] request done in {t_req1 - t_req0:.2f}s, err={bool(res.error_message)}")
+
     if res.error_message:
         st.error(f"翻译调用失败：\n\n{res.error_message}")
         st.stop()
 
+    # JSON parse stage
+    t_js0 = time.time()
+    if debug_log:
+        preview = (res.text or "")[:200].replace("\n", "\\n")
+        debug_log(f"[extract_json_object] begin, resp_preview='{preview}'")
+
     obj = extract_json_object(res.text)
+    t_js1 = time.time()
+    if debug_log:
+        debug_log(f"[extract_json_object] ok in {t_js1 - t_js0:.2f}s")
+
     out: Dict[str, List[str]] = {}
     items_out = obj.get("items", [])
     if not isinstance(items_out, list):
         raise ValueError("JSON schema error: items must be a list")
     for it in items_out:
         out[it["id"]] = it["segments"]
+
+    if debug_log:
+        debug_log(f"[doubao_translate_items] exit: out_items={len(out)}")
+
     return out
 
 def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min: int = 4000, clamp_max: int = 20000) -> int:
-    """
-    自动分批大小：
-    - 先估 total_json_chars
-    - 再除以 target_batches 得到 max_batch_chars
-    - clamp 到 [clamp_min, clamp_max]
-    """
     if not items:
         return 12000
     total = 0
@@ -730,8 +784,22 @@ def translate_docx_in_place(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     diagnostic_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     attempt_msg_cb: Optional[Callable[[str], None]] = None,
+    debug_log: Optional[Callable[[str], None]] = None,
 ):
+    """
+    debug_log: 实时输出 “到哪个函数/阶段了”，用于定位卡死点。
+    """
+    def _log(msg: str):
+        if debug_log:
+            debug_log(msg)
+
+    t0 = time.time()
+    _log("[translate_docx_in_place] enter")
+
+    # stage: scan paragraphs + build items
+    t_scan0 = time.time()
     all_ps = iter_all_paragraphs_extended(doc)
+    _log(f"[translate_docx_in_place] scanned paragraphs list ready: paragraphs_scanned={len(all_ps)}")
 
     items: List[dict] = []
     para_refs: Dict[str, Tuple[List[Any], List[Dict[str, str]]]] = {}
@@ -762,6 +830,9 @@ def translate_docx_in_place(
         items.append({"id": item_id, "segments": segs})
         para_refs[item_id] = (runs, maps)
 
+    t_scan1 = time.time()
+    _log(f"[translate_docx_in_place] build items done in {t_scan1 - t_scan0:.2f}s, items={len(items)}")
+
     if diagnostic_cb is not None:
         diagnostic_cb({
             "paragraphs_scanned": len(all_ps),
@@ -771,7 +842,6 @@ def translate_docx_in_place(
         })
 
     if not items:
-        # 关键：明确提示为什么“没有翻译”
         st.warning(
             "没有抓到可翻译的正文文本（items=0）。\n\n"
             "常见原因：\n"
@@ -782,33 +852,48 @@ def translate_docx_in_place(
             "- 若是文本框：优先用 Tab③ Pandoc 导出，或将文本框内容复制到正文段落后再翻译；\n"
             "- 或改走 PDF/图片 OCR 路线。"
         )
+        _log("[translate_docx_in_place] exit early: items=0")
         return
 
+    # stage: chunk
+    t_chunk0 = time.time()
     batches = chunk_items_for_api(items, max_chars=max_batch_chars)
+    t_chunk1 = time.time()
     total = len(batches)
+    _log(f"[translate_docx_in_place] chunk done in {t_chunk1 - t_chunk0:.2f}s, batches={total}, max_batch_chars={max_batch_chars}")
 
+    # stage: per-batch translate + writeback
     for bi, batch in enumerate(batches, start=1):
         if progress_cb:
             progress_cb(bi, total)
 
-        if attempt_msg_cb:
-            try:
-                approx_chars = sum(len(json.dumps(it, ensure_ascii=False)) for it in batch)
-            except Exception:
-                approx_chars = -1
-            attempt_msg_cb(
-                f"批次 {bi}/{total}：发送翻译请求（items={len(batch)}，approx_chars={approx_chars}）"
-            )
+        approx_chars = -1
+        try:
+            approx_chars = sum(len(json.dumps(it, ensure_ascii=False)) for it in batch)
+        except Exception:
+            pass
 
+        if attempt_msg_cb:
+            attempt_msg_cb(f"批次 {bi}/{total}：发送翻译请求（items={len(batch)}，approx_chars={approx_chars}）")
+        _log(f"[batch {bi}/{total}] start: items={len(batch)}, approx_chars={approx_chars}")
+
+        t_breq0 = time.time()
         translated_map = doubao_translate_items(
-            client=client, model=model, items=batch,
-            src_lang=src_lang, dst_lang=dst_lang,
+            client=client,
+            model=model,
+            items=batch,
+            src_lang=src_lang,
+            dst_lang=dst_lang,
             timeout_s=timeout_s,
+            debug_log=debug_log,
         )
+        t_breq1 = time.time()
+        _log(f"[batch {bi}/{total}] translate returned in {t_breq1 - t_breq0:.2f}s, got_keys={len(translated_map)}")
 
         if attempt_msg_cb:
-            attempt_msg_cb(f"批次 {bi}/{total}：收到响应，开始解析/写回…")
+            attempt_msg_cb(f"批次 {bi}/{total}：收到响应，开始写回…")
 
+        t_write0 = time.time()
         for it in batch:
             item_id = it["id"]
             if item_id not in translated_map:
@@ -828,8 +913,14 @@ def translate_docx_in_place(
             for r, seg, mp in zip(runs, out_segs, maps):
                 r.text = restore_tokens(seg, mp)
 
+        t_write1 = time.time()
+        _log(f"[batch {bi}/{total}] writeback done in {t_write1 - t_write0:.2f}s")
+
         if attempt_msg_cb:
             attempt_msg_cb(f"批次 {bi}/{total}：写回完成")
+
+    t1 = time.time()
+    _log(f"[translate_docx_in_place] exit: total_time={t1 - t0:.2f}s")
 
 
 # ============================================================
@@ -953,9 +1044,8 @@ with tabs[0]:
         if not HAVE_PYMUPDF:
             st.warning("未检测到 pymupdf，PDF 上传不可用。请 pip install pymupdf")
 
-    # 先把所有输入转换成 images list
     images: List[Image.Image] = []
-    page_meta: List[str] = []  # for page labeling
+    page_meta: List[str] = []
 
     if files:
         for f in files:
@@ -1106,8 +1196,17 @@ with tabs[1]:
         max_batch_chars = 12000  # will be computed after parsing doc
 
     show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
+    show_realtime_log = st.checkbox("显示翻译实时日志（定位卡点必开）", value=True)
+
+    # 实时日志窗口（只在 Tab② 用，不影响其他功能）
+    log_box = st.empty()
+    log, log_clear = make_realtime_logger(log_box, key="__translate_rtlog__", max_lines=300)
 
     if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
+        if show_realtime_log:
+            log_clear()
+            log("UI: start button clicked")
+
         if not st.session_state["model_id"].strip():
             st.error("请先填写 model（ep-xxxx 或模型ID）。")
             st.stop()
@@ -1118,15 +1217,21 @@ with tabs[1]:
         doc = Document(io.BytesIO(doc_bytes))
 
         if do_equation_replace:
+            if show_realtime_log:
+                log("[equation_replace] begin: extract_math_from_docx_with_pandoc")
             with st.spinner("提取公式序列（pandoc）..."):
                 math_seq = extract_math_from_docx_with_pandoc(doc_bytes)
+            if show_realtime_log:
+                log(f"[equation_replace] extracted math_seq={len(math_seq)}")
+                log("[equation_replace] begin: replace_omml_with_latex_code")
             with st.spinner("替换 Word 原生公式为 LaTeX 代码（best-effort）..."):
                 replaced_count = replace_omml_with_latex_code(doc, math_seq, use_equation_env=True)
             st.info(f"已替换公式数量（best-effort）：{replaced_count}")
+            if show_realtime_log:
+                log(f"[equation_replace] done: replaced_count={replaced_count}")
 
         if do_translate:
             batch_bar = st.progress(0, text="准备翻译…")
-
             diag_box = st.empty()
             attempt_box = st.empty()
 
@@ -1138,9 +1243,9 @@ with tabs[1]:
             def _diag_cb(payload: Dict[str, Any]):
                 diag_payload_holder.update(payload)
 
-            # 先“预扫描”一次 items 以便自动分批（不重复实现：直接在函数里回调诊断）
-            # 技巧：先调用一次 translate_docx_in_place 之前计算批大小 ——我们需要 items 列表。
-            # 为避免重写大量逻辑，这里用同一套构建逻辑再构建一次 items（轻量）。
+            # 为自动分批：轻量预扫描 items（只用于估算 max_batch_chars，不写回 doc）
+            if show_realtime_log:
+                log("[auto_batch_preview] begin: build items_preview")
             all_ps = iter_all_paragraphs_extended(doc)
             items_preview: List[dict] = []
             pid = 0
@@ -1157,15 +1262,23 @@ with tabs[1]:
                 pid += 1
                 items_preview.append({"id": f"p{pid}", "segments": segs})
 
+            if show_realtime_log:
+                log(f"[auto_batch_preview] done: items_preview={len(items_preview)}")
+
             if auto_batch:
                 max_batch_chars = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
                 st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars}")
+                if show_realtime_log:
+                    log(f"[auto_batch] estimated max_batch_chars={max_batch_chars}")
 
             if show_translate_diagnostics:
                 diag_box.info(
                     "诊断将在开始后显示：扫描段落数 / 可翻译 items 数 / runs 数 / 字符数。\n"
                     "若 items=0，多半是内容在文本框/形状里（python-docx 读不到）。"
                 )
+
+            if show_realtime_log:
+                log("[translate] begin: translate_docx_in_place")
 
             with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
                 translate_docx_in_place(
@@ -1179,7 +1292,11 @@ with tabs[1]:
                     progress_cb=_batch_cb,
                     diagnostic_cb=_diag_cb,
                     attempt_msg_cb=(lambda msg: attempt_box.info(msg)),
+                    debug_log=(log if show_realtime_log else None),
                 )
+
+            if show_realtime_log:
+                log("[translate] done: translate_docx_in_place finished")
 
             if show_translate_diagnostics and diag_payload_holder:
                 diag_box.success(
@@ -1193,6 +1310,9 @@ with tabs[1]:
         out_docx_bytes = doc_to_bytes(doc)
         st.success("处理完成")
         st.download_button("下载 new.docx", data=out_docx_bytes, file_name="new.docx")
+
+        if show_realtime_log:
+            log("[UI] export new.docx ready")
 
 
 # ---------------------------
