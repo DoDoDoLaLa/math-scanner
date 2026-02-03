@@ -85,8 +85,16 @@ class ArkResult:
     error_message: Optional[str] = None
 
 
+# —— 按你截图：默认 base_url / model —— #
+DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_ARK_MODEL = "doubao-seed-1-8-251228"
+
+
 def get_api_key() -> str:
-    # Streamlit secrets 优先，其次环境变量
+    """
+    优先：Streamlit secrets（.streamlit/secrets.toml）
+    其次：环境变量 ARK_API_KEY
+    """
     k = None
     try:
         if "ARK_API_KEY" in st.secrets:
@@ -101,16 +109,31 @@ def get_api_key() -> str:
 
 
 def get_ark_base_url() -> str:
-    # 官方常用： https://ark.cn-beijing.volces.com/api/v3
+    """
+    按你截图：默认北京地域的 Ark base_url
+    """
+    v = None
     try:
         v = st.secrets.get("ARK_BASE_URL", None)
     except Exception:
         v = None
-    return v or os.environ.get("ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3"
+    return v or os.environ.get("ARK_BASE_URL") or DEFAULT_ARK_BASE_URL
+
+
+def get_default_model() -> str:
+    """
+    按你截图：默认模型 doubao-seed-1-8-251228
+    你也可以在 secrets / env 覆盖，或在侧边栏手动改 ep-xxxx
+    """
+    v = None
+    try:
+        v = st.secrets.get("ARK_MODEL", None)
+    except Exception:
+        v = None
+    return v or os.environ.get("ARK_MODEL") or os.environ.get("ARK_ENDPOINT_ID") or DEFAULT_ARK_MODEL
 
 
 def get_ark_client() -> OpenAI:
-    # Ark 对 OpenAI 兼容：改 base_url + api_key
     return OpenAI(api_key=get_api_key(), base_url=get_ark_base_url())
 
 
@@ -134,9 +157,9 @@ def safe_chat_completions(
 ) -> ArkResult:
     """
     使用 Ark(OpenAI-compatible) /chat/completions
-    model: 既可以是：
+    model: 可填
       - 推理接入点 Endpoint ID（通常 ep- 开头）
-      - 也可以是模型 ID（例如：doubao-seed-1-8-251228）
+      - 或模型 ID（例如 doubao-seed-1-8-251228）
     """
     last_err: Any = None
     for attempt in range(retries):
@@ -621,12 +644,12 @@ tabs = st.tabs(["① 图片 OCR → 导出", "② 上传 Word(.docx) → LaTeX �
 with st.sidebar:
     st.subheader("豆包/火山方舟设置")
 
-    # 关键改动：既支持 ep-xxxx，也支持 doubao-seed-1-8-251228
+    # ✅ 按截图：默认模型写死为 doubao-seed-1-8-251228（可被 secrets/env 覆盖）
     model_id = st.text_input(
         "model（可填 ep- 推理接入点，也可填模型ID）",
-        value=os.environ.get("ARK_MODEL", os.environ.get("ARK_ENDPOINT_ID", "")),
+        value=get_default_model(),
         placeholder="例如：doubao-seed-1-8-251228 或 ep-2026xxxx",
-        help="你截图里的 model 是 doubao-seed-1-8-251228；如果你创建了推理接入点，也可以填 ep-xxxx。"
+        help="截图示例模型：doubao-seed-1-8-251228；如果你创建了推理接入点，也可以填 ep-xxxx。"
     )
 
     st.caption(f"Base URL: {get_ark_base_url()}")
@@ -639,7 +662,7 @@ with st.sidebar:
     jpeg_q = st.slider("JPEG quality", 50, 95, 85, 1)
     out_tokens = st.slider("OCR max tokens", 1024, 8192, 4096, 256)
 
-    st.info("提示：请确认已配置 ARK_API_KEY；model 直接填 doubao-seed-1-8-251228 也可。")
+    st.info("提示：请确认已配置 ARK_API_KEY；model 默认已设为 doubao-seed-1-8-251228。")
 
 
 with tabs[0]:
