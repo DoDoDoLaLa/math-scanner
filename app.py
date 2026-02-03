@@ -35,6 +35,7 @@ import pypandoc
 st.set_page_config(page_title="OCR + LaTeX(equation) + DOCX Translate", layout="wide")
 st.title("豆包(Ark) OCR → Word（含第三版 LaTeX equation 代码） + 上传 Word 可选翻译/公式转 LaTeX 代码")
 
+
 def ensure_pandoc():
     try:
         _ = pypandoc.get_pandoc_path()
@@ -43,6 +44,7 @@ def ensure_pandoc():
             pypandoc.download_pandoc()
         except Exception:
             pass
+
 
 ensure_pandoc()
 
@@ -76,7 +78,7 @@ TRANSLATE_PROMPT_TEMPLATE = r"""
 
 
 # =========================
-# 2) Ark client and safe call
+# 2) Ark config / client / retry
 # =========================
 @dataclass
 class ArkResult:
@@ -85,9 +87,11 @@ class ArkResult:
     error_message: Optional[str] = None
 
 
-# —— 按你截图：默认 base_url / model —— #
+# 按你截图：北京地域 base_url
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_ARK_MODEL = "doubao-seed-1-8-251228"
+
+# ✅ 按你的要求：默认接入你的 EP
+DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"
 
 
 def get_api_key() -> str:
@@ -110,7 +114,7 @@ def get_api_key() -> str:
 
 def get_ark_base_url() -> str:
     """
-    按你截图：默认北京地域的 Ark base_url
+    默认北京地域 Ark base_url，可被 secrets/env 覆盖
     """
     v = None
     try:
@@ -122,8 +126,8 @@ def get_ark_base_url() -> str:
 
 def get_default_model() -> str:
     """
-    按你截图：默认模型 doubao-seed-1-8-251228
-    你也可以在 secrets / env 覆盖，或在侧边栏手动改 ep-xxxx
+    model 优先级：secrets > env > DEFAULT_EP
+    允许你后续在 secrets/env 中切换为别的 ep-xxxx 或模型ID
     """
     v = None
     try:
@@ -133,8 +137,14 @@ def get_default_model() -> str:
     return v or os.environ.get("ARK_MODEL") or os.environ.get("ARK_ENDPOINT_ID") or DEFAULT_ARK_MODEL
 
 
+@st.cache_resource(show_spinner=False)
+def get_ark_client_cached(api_key: str, base_url: str) -> OpenAI:
+    # 复用 client，减少重复初始化
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
 def get_ark_client() -> OpenAI:
-    return OpenAI(api_key=get_api_key(), base_url=get_ark_base_url())
+    return get_ark_client_cached(get_api_key(), get_ark_base_url())
 
 
 def _parse_retry_delay_seconds(msg: str) -> Optional[float]:
@@ -156,10 +166,8 @@ def safe_chat_completions(
     retries: int = 6,
 ) -> ArkResult:
     """
-    使用 Ark(OpenAI-compatible) /chat/completions
-    model: 可填
-      - 推理接入点 Endpoint ID（通常 ep- 开头）
-      - 或模型 ID（例如 doubao-seed-1-8-251228）
+    Ark(OpenAI-compatible) /chat/completions
+    model = ep-xxxx 或 模型ID（doubao-seed-...）
     """
     last_err: Any = None
     for attempt in range(retries):
@@ -180,20 +188,22 @@ def safe_chat_completions(
             msg = f"{type(e).__name__}: {e}"
             last_err = msg
 
-            if "429" in msg or "rate limit" in msg.lower() or "RESOURCE_EXHAUSTED" in msg:
+            # 429 / 配额不足：按提示等待 or 指数退避
+            if ("429" in msg) or ("rate limit" in msg.lower()) or ("RESOURCE_EXHAUSTED" in msg):
                 wait_s = _parse_retry_delay_seconds(msg)
                 if wait_s is None:
                     wait_s = min(2 ** attempt, 60)
                 time.sleep(min(wait_s + 0.3, 90.0))
                 continue
 
+            # 其他错误：短暂退避
             time.sleep(min(2 ** attempt, 30))
 
     return ArkResult(text="", status_code=None, error_message=f"retry exhausted: {last_err}")
 
 
 # =========================
-# 3) OCR helpers (image → markdown)
+# 3) OCR helpers
 # =========================
 def downscale(img: Image.Image, max_side: int) -> Image.Image:
     img = img.convert("RGB")
@@ -234,6 +244,7 @@ def normalize_md(md: str) -> str:
 
 
 def dedupe_tail_head(prev: str, cur: str, max_lines: int = 18) -> str:
+    # 仍保留你的快速去重（best-effort）
     pl = [x.strip() for x in prev.splitlines() if x.strip()]
     cl = [x.strip() for x in cur.splitlines() if x.strip()]
     if not pl or not cl:
@@ -267,12 +278,17 @@ def ocr_image_to_markdown(
     overlap: int,
     jpeg_q: int,
     out_tokens: int,
+    progress_cb=None,
 ) -> str:
     img = downscale(img, max_side=max_side)
     tiles = slice_long(img, tile_h=tile_h, overlap=overlap)
 
     chunks: List[str] = []
-    for i, timg in enumerate(tiles, start=1):
+    total = len(tiles)
+    for idx, timg in enumerate(tiles, start=1):
+        if progress_cb:
+            progress_cb(idx, total)
+
         b = pil_to_jpeg_bytes(timg, quality=jpeg_q)
         data_url = _jpeg_bytes_to_data_url(b)
 
@@ -305,10 +321,11 @@ def ocr_image_to_markdown(
 
 
 # =========================
-# 4) LaTeX code format: use \begin{equation}...\end{equation}
+# 4) LaTeX code format
 # =========================
 DISPLAY_MATH_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
 INLINE_MATH_RE = re.compile(r"(?<!\$)\$([^$\n]+)\$(?!\$)")
+
 
 def display_to_equation_env(md: str) -> str:
     def repl(m):
@@ -316,11 +333,13 @@ def display_to_equation_env(md: str) -> str:
         return "\\begin{equation}\n" + body + "\n\\end{equation}"
     return DISPLAY_MATH_RE.sub(repl, md)
 
+
 def inline_to_paren(md: str) -> str:
     def repl(m):
         body = m.group(1).strip()
         return "\\(" + body + "\\)"
     return INLINE_MATH_RE.sub(repl, md)
+
 
 def md_to_latex_code_style(md: str) -> str:
     md2 = normalize_md(md)
@@ -332,26 +351,34 @@ def md_to_latex_code_style(md: str) -> str:
 
 
 # =========================
-# 5) DOCX translate (preserve layout) + optional equation replacement
+# 5) DOCX translate + equation replacement
 # =========================
-MATH_TOKEN_RE = re.compile(r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\))", re.DOTALL)
+MATH_TOKEN_RE = re.compile(
+    r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\))",
+    re.DOTALL
+)
+
 
 def protect_math(text: str) -> Tuple[str, Dict[str, str]]:
     mapping: Dict[str, str] = {}
     k = 0
+
     def repl(m):
         nonlocal k
         token = f"__MATH_{k}__"
         mapping[token] = m.group(0)
         k += 1
         return token
+
     out = MATH_TOKEN_RE.sub(repl, text)
     return out, mapping
+
 
 def restore_tokens(text: str, mapping: Dict[str, str]) -> str:
     for tok, val in mapping.items():
         text = text.replace(tok, val)
     return text
+
 
 def iter_table_paragraphs(table: Table) -> List[Paragraph]:
     out: List[Paragraph] = []
@@ -362,13 +389,14 @@ def iter_table_paragraphs(table: Table) -> List[Paragraph]:
                 out.extend(iter_table_paragraphs(t2))
     return out
 
+
 def iter_all_paragraphs(doc: Document) -> List[Paragraph]:
     ps: List[Paragraph] = []
-    for p in doc.paragraphs:
-        ps.append(p)
+    ps.extend(doc.paragraphs)
     for table in doc.tables:
         ps.extend(iter_table_paragraphs(table))
     return ps
+
 
 def extract_math_from_docx_with_pandoc(docx_bytes: bytes) -> List[Tuple[str, str]]:
     with tempfile.TemporaryDirectory() as td:
@@ -386,6 +414,7 @@ def extract_math_from_docx_with_pandoc(docx_bytes: bytes) -> List[Tuple[str, str
     matches.sort(key=lambda x: x[0])
     return [(k, b) for _, _, k, b in matches]
 
+
 def insert_text_run_at_paragraph_child(p_elm, idx: int, text: str):
     r = OxmlElement("w:r")
     t = OxmlElement("w:t")
@@ -394,6 +423,7 @@ def insert_text_run_at_paragraph_child(p_elm, idx: int, text: str):
     t.text = text
     r.append(t)
     p_elm.insert(idx, r)
+
 
 def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]], use_equation_env: bool = True) -> int:
     all_ps = iter_all_paragraphs(doc)
@@ -410,9 +440,9 @@ def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]],
             seq_idx += 1
 
             if use_equation_env:
-                latex_text = ("\\begin{equation} " + body + " \\end{equation}") if kind == "display" else ("\\(" + body + "\\)")
+                latex_text = (f"\\begin{{equation}} {body} \\end{{equation}}") if kind == "display" else (f"\\({body}\\)")
             else:
-                latex_text = ("$$ " + body + " $$") if kind == "display" else ("$ " + body + " $")
+                latex_text = (f"$$ {body} $$") if kind == "display" else (f"$ {body} $")
 
             parent = node.getparent()
             if parent is None:
@@ -506,8 +536,11 @@ def doubao_translate_items(
     src_lang: str,
     dst_lang: str,
 ) -> Dict[str, List[str]]:
+    # ✅ Auto 时，提示模型自动检测源语言
+    src = "auto-detect" if src_lang == "Auto" else src_lang
+
     prompt = (TRANSLATE_PROMPT_TEMPLATE
-              .replace("__SRC_LANG__", src_lang)
+              .replace("__SRC_LANG__", src)
               .replace("__DST_LANG__", dst_lang))
 
     payload = {"items": items}
@@ -529,32 +562,19 @@ def doubao_translate_items(
         st.error(f"豆包翻译调用失败：\n\n{res.error_message}")
         st.stop()
 
-    try:
-        obj = extract_json_object(res.text)
-    except Exception as e:
-        st.error(f"JSON parse failed: {e}")
-        st.markdown("#### Raw model output (first 2000 chars)")
-        st.code((res.text or "")[:2000], language="text")
-        st.stop()
+    obj = extract_json_object(res.text)
 
     out: Dict[str, List[str]] = {}
     items_out = obj.get("items", [])
     if not isinstance(items_out, list):
-        st.error("JSON schema error: expected obj['items'] to be a list.")
-        st.code(json.dumps(obj, ensure_ascii=False, indent=2)[:2000], language="json")
-        st.stop()
+        raise ValueError("JSON schema error: expected obj['items'] to be a list")
 
     for it in items_out:
-        try:
-            _id = it["id"]
-            _segs = it["segments"]
-            if not isinstance(_segs, list):
-                raise ValueError("segments is not a list")
-            out[_id] = _segs
-        except Exception:
-            st.error("JSON item schema error (expected {'id':..., 'segments':[...]}). Bad item:")
-            st.code(json.dumps(it, ensure_ascii=False, indent=2)[:2000], language="json")
-            st.stop()
+        _id = it["id"]
+        _segs = it["segments"]
+        if not isinstance(_segs, list):
+            raise ValueError("JSON schema error: segments must be a list")
+        out[_id] = _segs
 
     return out
 
@@ -566,6 +586,7 @@ def translate_docx_in_place(
     src_lang: str,
     dst_lang: str,
     max_batch_chars: int = 12000,
+    progress_cb=None,
 ):
     all_ps = iter_all_paragraphs(doc)
 
@@ -595,8 +616,12 @@ def translate_docx_in_place(
         para_refs[item_id] = (runs, maps)
 
     batches = chunk_items_for_api(items, max_chars=max_batch_chars)
+    total = len(batches)
 
-    for batch in batches:
+    for bi, batch in enumerate(batches, start=1):
+        if progress_cb:
+            progress_cb(bi, total)
+
         translated_map = doubao_translate_items(client, model, batch, src_lang=src_lang, dst_lang=dst_lang)
 
         for it in batch:
@@ -627,6 +652,7 @@ def doc_to_bytes(doc: Document) -> bytes:
     buf.seek(0)
     return buf.read()
 
+
 def pandoc_md_to_docx(md: str) -> bytes:
     md = normalize_md(md) + "\n"
     with tempfile.TemporaryDirectory() as td:
@@ -644,12 +670,12 @@ tabs = st.tabs(["① 图片 OCR → 导出", "② 上传 Word(.docx) → LaTeX �
 with st.sidebar:
     st.subheader("豆包/火山方舟设置")
 
-    # ✅ 按截图：默认模型写死为 doubao-seed-1-8-251228（可被 secrets/env 覆盖）
+    # ✅ 默认直接填你的 EP
     model_id = st.text_input(
         "model（可填 ep- 推理接入点，也可填模型ID）",
         value=get_default_model(),
-        placeholder="例如：doubao-seed-1-8-251228 或 ep-2026xxxx",
-        help="截图示例模型：doubao-seed-1-8-251228；如果你创建了推理接入点，也可以填 ep-xxxx。"
+        placeholder="例如：ep-20260203141749-992fx 或 doubao-seed-1-8-251228",
+        help="当前默认已接入：ep-20260203141749-992fx（可在此改为其它 ep-xxxx 或模型ID）。"
     )
 
     st.caption(f"Base URL: {get_ark_base_url()}")
@@ -662,8 +688,7 @@ with st.sidebar:
     jpeg_q = st.slider("JPEG quality", 50, 95, 85, 1)
     out_tokens = st.slider("OCR max tokens", 1024, 8192, 4096, 256)
 
-    st.info("提示：请确认已配置 ARK_API_KEY；model 默认已设为 doubao-seed-1-8-251228。")
-
+    st.info("提示：请配置 ARK_API_KEY（secrets 或环境变量）。默认已使用你提供的 EP。")
 
 with tabs[0]:
     st.subheader("① 图片 OCR（多图 + 长图切片）")
@@ -671,16 +696,32 @@ with tabs[0]:
 
     if st.button("开始 OCR 并导出", type="primary", disabled=(not imgs)):
         if not model_id.strip():
-            st.error("请先在左侧填写 model（doubao-seed-1-8-251228 或 ep-xxxx）。")
+            st.error("请先在左侧填写 model（ep-xxxx 或模型ID）。")
             st.stop()
 
         client = get_ark_client()
 
         pages = []
-        for i, f in enumerate(imgs, start=1):
+        page_progress = st.progress(0, text="准备 OCR…")
+        total_pages = len(imgs)
+
+        for pi, f in enumerate(imgs, start=1):
             img = Image.open(f)
-            md = ocr_image_to_markdown(client, model_id.strip(), img, max_side, tile_h, overlap, jpeg_q, out_tokens)
-            pages.append(f"## 第 {i} 页\n\n{md}")
+
+            tile_progress = st.progress(0, text=f"OCR 第 {pi}/{total_pages} 页：准备切片…")
+
+            def _tile_cb(cur, total):
+                tile_progress.progress(int(cur / total * 100), text=f"OCR 第 {pi}/{total_pages} 页：切片 {cur}/{total}")
+
+            md = ocr_image_to_markdown(
+                client, model_id.strip(), img,
+                max_side, tile_h, overlap, jpeg_q, out_tokens,
+                progress_cb=_tile_cb
+            )
+            pages.append(f"## 第 {pi} 页\n\n{md}")
+
+            page_progress.progress(int(pi / total_pages * 100), text=f"已完成 {pi}/{total_pages} 页")
+            tile_progress.empty()
 
         merged_md = normalize_md("\n\n---\n\n".join(pages))
 
@@ -700,7 +741,6 @@ with tabs[0]:
         st.download_button("下载 V3：LaTeX_equation_code.md", data=v3_md.encode("utf-8"),
                            file_name="OCR_LaTeX_equation_code.md")
 
-
 with tabs[1]:
     st.subheader("② 上传 Word(.docx) → LaTeX 代码 / 可选翻译（保持原排版）")
 
@@ -718,7 +758,7 @@ with tabs[1]:
 
     if st.button("开始处理并导出", type="primary", disabled=not docx_file):
         if not model_id.strip():
-            st.error("请先在左侧填写 model（doubao-seed-1-8-251228 或 ep-xxxx）。")
+            st.error("请先在左侧填写 model（ep-xxxx 或模型ID）。")
             st.stop()
 
         client = get_ark_client()
@@ -737,6 +777,11 @@ with tabs[1]:
             st.info(f"已替换公式数量（best-effort）：{replaced_count}")
 
         if do_translate:
+            prog = st.progress(0, text="准备翻译…")
+
+            def _batch_cb(cur, total):
+                prog.progress(int(cur / total * 100), text=f"翻译批次 {cur}/{total}")
+
             with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
                 translate_docx_in_place(
                     doc=doc,
@@ -745,6 +790,7 @@ with tabs[1]:
                     src_lang=src_lang,
                     dst_lang=dst_lang,
                     max_batch_chars=max_batch_chars,
+                    progress_cb=_batch_cb,
                 )
 
         out_docx_bytes = doc_to_bytes(doc)
