@@ -8,6 +8,7 @@ import json
 import time
 import base64
 import tempfile
+import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
@@ -183,17 +184,36 @@ def safe_chat_completions(
                 pass
 
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout_s,
-            )
+            # 重要：某些环境里 http 超时/流控可能导致请求“看起来卡死”。
+            # 这里用线程包一层硬超时：即使底层库未按预期抛超时，我们也能继续重试并给出可见反馈。
+            def _do_req():
+                return client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout_s,
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_do_req)
+                resp = fut.result(timeout=float(timeout_s) + 5.0)
             txt = ""
             if resp and resp.choices and resp.choices[0].message and resp.choices[0].message.content:
                 txt = resp.choices[0].message.content
             return ArkResult(text=(txt or "").strip())
+
+        except concurrent.futures.TimeoutError:
+            msg = f"TimeoutError: request exceeded {timeout_s}s"
+            last_err = msg
+            wait_s = min(2 ** (attempt - 1), 20)
+            if on_attempt:
+                try:
+                    on_attempt(attempt, retries, f"request timeout, sleep {wait_s:.1f}s")
+                except Exception:
+                    pass
+            time.sleep(wait_s)
+            continue
 
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
@@ -771,11 +791,23 @@ def translate_docx_in_place(
         if progress_cb:
             progress_cb(bi, total)
 
+        if attempt_msg_cb:
+            try:
+                approx_chars = sum(len(json.dumps(it, ensure_ascii=False)) for it in batch)
+            except Exception:
+                approx_chars = -1
+            attempt_msg_cb(
+                f"批次 {bi}/{total}：发送翻译请求（items={len(batch)}，approx_chars={approx_chars}）"
+            )
+
         translated_map = doubao_translate_items(
             client=client, model=model, items=batch,
             src_lang=src_lang, dst_lang=dst_lang,
             timeout_s=timeout_s,
         )
+
+        if attempt_msg_cb:
+            attempt_msg_cb(f"批次 {bi}/{total}：收到响应，开始解析/写回…")
 
         for it in batch:
             item_id = it["id"]
@@ -795,6 +827,9 @@ def translate_docx_in_place(
 
             for r, seg, mp in zip(runs, out_segs, maps):
                 r.text = restore_tokens(seg, mp)
+
+        if attempt_msg_cb:
+            attempt_msg_cb(f"批次 {bi}/{total}：写回完成")
 
 
 # ============================================================
