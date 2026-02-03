@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
 
 import streamlit as st
+from lxml import etree
 from PIL import Image, ImageFilter, ImageOps
 
 from openai import OpenAI
@@ -376,6 +377,38 @@ def analyze_image_density(img: Image.Image) -> Dict[str, float]:
 
     return {"edge_density": edge_density, "dark_ratio": dark_ratio, "w": float(img.size[0]), "h": float(img.size[1])}
 
+def ark_chat_translate_text(
+    client: OpenAI,
+    model: str,
+    text: str,
+    src_lang: str,
+    dst_lang: str,
+    timeout_s: int,
+) -> str:
+    """
+    Fallback path for translation models that DON'T support /responses (e.g. some base model IDs).
+    Uses chat.completions with a strict, low-variance prompt.
+    """
+    src = "auto" if src_lang == "Auto" else _to_lang_code(src_lang) or "auto"
+    dst = _to_lang_code(dst_lang) or dst_lang
+    sys = (
+        "You are a professional translator. Output ONLY the translated text, no explanations. "
+        "Preserve math, symbols, and placeholders exactly. Do NOT translate tokens like __MATH_0__."
+    )
+    user = f"Translate from {src} to {dst}:\n\n{text}"
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0,
+            timeout=timeout_s,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out
+    except Exception as e:
+        raise RuntimeError(f"Ark chat.completions translate failed: {type(e).__name__}: {e}")
+
+
 def recommend_ocr_params(img: Image.Image, mode: str = "Balanced") -> Dict[str, int]:
     m = analyze_image_density(img)
     h = int(m["h"])
@@ -583,7 +616,7 @@ def md_to_latex_code_style(md: str) -> str:
 # 6) DOCX translate (preserve layout, best-effort) + equation replacement
 # ============================================================
 MATH_TOKEN_RE = re.compile(
-    r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\)|\\\\\\[.+?\\\\\\])",
+    r"(\$\$.*?\$\$|\$(?:\.|[^$\n])+\$|\\(.+?\\)|\\[.+?\\]|\begin\{equation\}.*?\end\{equation\})",
     re.DOTALL
 )
 
@@ -642,7 +675,7 @@ def pandoc_math_to_omml_xml(token: str) -> str:
         for p in d.paragraphs:
             nodes = p._p.xpath(".//*[local-name()='oMath' or local-name()='oMathPara']")
             if nodes:
-                return nodes[0].xml
+                return etree.tostring(nodes[0], encoding='unicode')
 
     raise RuntimeError("Pandoc did not emit OMML for this token; check delimiters/latex.")
 
@@ -725,6 +758,114 @@ def convert_inline_latex_tokens_to_omml_in_doc(doc: Document, log: Optional[Call
 
             converted += 1
 
+    return converted
+
+
+def _run_vert_align(run: Run) -> str:
+    """Return 'sub', 'sup' or '' for a run."""
+    try:
+        if run.font.subscript:
+            return "sub"
+        if run.font.superscript:
+            return "sup"
+    except Exception:
+        pass
+    try:
+        # Fallback to raw XML
+        vals = run._r.xpath("./w:rPr/w:vertAlign/@w:val")
+        if vals:
+            v = str(vals[0]).lower()
+            if "sub" in v:
+                return "sub"
+            if "sup" in v:
+                return "sup"
+    except Exception:
+        pass
+    return ""
+
+def _is_mathy_run_text(s: str) -> bool:
+    if not s:
+        return False
+    # stop on whitespace; keep common math punctuation/operators
+    return not bool(re.search(r"\s", s))
+
+def convert_subsup_runs_to_omml_in_doc(doc: Document, log: Optional[Callable[[str], None]] = None) -> int:
+    """
+    Detect patterns like P + (subscript c) + (t) in DOCX runs and convert to a single editable OMML equation.
+    This covers the common case where users typed subscripts/superscripts using Word formatting instead of $...$.
+    Best-effort and intentionally conservative (won't touch anything containing whitespace).
+    """
+    _ensure_pandoc_ok()
+    converted = 0
+    for p in iter_all_paragraphs_extended(doc):
+        runs = p.runs
+        if not runs:
+            continue
+
+        i = 0
+        while i < len(runs):
+            va = _run_vert_align(runs[i])
+            if not va:
+                i += 1
+                continue
+
+            # choose a conservative group boundary around this subsup run
+            start = i
+            if i > 0 and _is_mathy_run_text(runs[i - 1].text or ""):
+                start = i - 1
+
+            end = i
+            j = start
+            saw_subsup = False
+            while j < len(runs):
+                t = runs[j].text or ""
+                if not _is_mathy_run_text(t):
+                    break
+                if _run_vert_align(runs[j]):
+                    saw_subsup = True
+                end = j
+                j += 1
+
+            if not saw_subsup:
+                i = j
+                continue
+
+            # build LaTeX from runs[start:end]
+            parts: List[str] = []
+            ok = True
+            for k in range(start, end + 1):
+                t = runs[k].text or ""
+                if not t:
+                    continue
+                v = _run_vert_align(runs[k])
+                if v == "sub":
+                    parts.append("_{%s}" % t)
+                elif v == "sup":
+                    parts.append("^{%s}" % t)
+                else:
+                    parts.append(t)
+            expr = "".join(parts).strip()
+            if not expr:
+                i = j
+                continue
+
+            token = f"${expr}$"
+            try:
+                omml_xml = pandoc_math_to_omml_xml(token)
+            except Exception as e:
+                if log:
+                    log(f"公式转换失败（跳过）：{type(e).__name__}: {e} | expr={expr}")
+                i = j
+                continue
+
+            # clear texts and insert OMML after start run
+            for k in range(start, end + 1):
+                runs[k].text = ""
+            omml = parse_xml(omml_xml)
+            runs[start]._r.addnext(omml)
+            converted += 1
+
+            i = j  # continue scanning after the group
     return converted
 def protect_math(text: str) -> Tuple[str, Dict[str, str]]:
     mapping: Dict[str, str] = {}
@@ -940,7 +1081,9 @@ def doubao_translate_items(
     # which is the official calling pattern for doubao-seed-translation.
     # (Calling it via chat.completions often fails or returns non-JSON.)
     model_l = (model or "").lower()
-    if ("seed-translation" in model_l) or model_l.startswith("ep-") or model_l.startswith("doubao-seed-translation"):
+    if model_l.startswith("ep-"):
+        # EP supports /responses translation_options
+        
         out: Dict[str, List[str]] = {}
         for it in items:
             _id = it.get("id")
@@ -965,6 +1108,36 @@ def doubao_translate_items(
             st.error(f"翻译输出缺失 items：{missing[:5]} ... total {len(missing)}")
             st.stop()
         return out
+    # If user picked the translation foundation model (not an EP), /responses may be rejected with
+    # "does not support this api". In that case, fall back to chat.completions translation.
+    if ("seed-translation" in model_l) or model_l.startswith("doubao-seed-translation"):
+        out: Dict[str, List[str]] = {}
+        max_workers = min(6, max(1, len(items)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = []
+            for it in items:
+                _id = it.get("id")
+                segs = it.get("segments", [])
+                if not _id or not isinstance(segs, list):
+                    continue
+                for si, s in enumerate(segs):
+                    if not isinstance(s, str) or not s.strip():
+                        continue
+                    futs.append(( _id, si, ex.submit(ark_chat_translate_text, client, model, s, src_lang, dst_lang, timeout_s) ))
+            # init empty outputs
+            for it in items:
+                _id = it.get("id")
+                segs = it.get("segments", [])
+                if _id and isinstance(segs, list):
+                    out[_id] = [x if isinstance(x, str) else "" for x in segs]
+            for _id, si, fut in futs:
+                try:
+                    out[_id][si] = fut.result()
+                except Exception as e:
+                    st.error(f"翻译调用失败（chat.completions）：{type(e).__name__}: {e}")
+                    st.stop()
+        return out
+
 
     src = "auto-detect" if src_lang == "Auto" else src_lang
     prompt = TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src).replace("__DST_LANG__", dst_lang)
@@ -1469,8 +1642,9 @@ with tabs[1]:
         # 0) 文本 LaTeX 公式 -> Word 可编辑公式（OMML）（Pandoc，无需 Office）
         if do_latex_to_omml:
             try:
-                n_conv = convert_inline_latex_tokens_to_omml_in_doc(doc, log=lambda s: st.info(s))
-                st.success(f"LaTeX→OMML 转换完成：{n_conv} 处")
+                n_inline = convert_inline_latex_tokens_to_omml_in_doc(doc, log=lambda s: st.info(s))
+                n_subsup = convert_subsup_runs_to_omml_in_doc(doc, log=lambda s: st.info(s))
+                st.success(f"公式→OMML 转换完成：inline_latex={n_inline}, subsup_groups={n_subsup}")
             except Exception as e:
                 st.error(f"LaTeX→OMML 转换失败：{type(e).__name__}: {e}")
                 st.stop()
