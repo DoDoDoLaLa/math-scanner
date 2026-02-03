@@ -10,7 +10,7 @@ import base64
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
+from typing import Dict, List, Tuple, Optional, Any, Callable
 
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
@@ -25,7 +25,7 @@ from docx.oxml.ns import qn
 
 import pypandoc
 
-# PDF rendering (optional but recommended)
+# PDF rendering (optional)
 try:
     import fitz  # PyMuPDF
     HAVE_PYMUPDF = True
@@ -38,21 +38,25 @@ except Exception:
 # ============================================================
 st.set_page_config(page_title="Ark OCR / DOCX Translate / LaTeX Export", layout="wide")
 st.title("学术 OCR & Word→LaTeX 工具（Ark EP 已接入）")
+st.caption("面向论文/讲义/教材：PDF/图片OCR→Markdown/Word；Word→翻译（best-effort + 强校验）；Word→LaTeX/Markdown。")
 
-st.caption(
-    "面向论文/讲义/教材：PDF/图片OCR→Markdown/Word；Word（含可编辑公式）→LaTeX/Markdown；Word 原排版内翻译（best-effort）。"
-)
 
-def ensure_pandoc():
+def ensure_pandoc() -> bool:
+    """尽量保证 pandoc 可用；不可用则不阻塞启动。"""
     try:
         _ = pypandoc.get_pandoc_path()
+        return True
     except OSError:
         try:
             pypandoc.download_pandoc()
+            _ = pypandoc.get_pandoc_path()
+            return True
         except Exception:
-            pass
+            return False
 
-ensure_pandoc()
+PANDOC_OK = ensure_pandoc()
+if not PANDOC_OK:
+    st.warning("Pandoc 不可用：Tab③ 导出 / Tab① Markdown→docx 渲染可能受影响。")
 
 
 # ============================================================
@@ -73,13 +77,29 @@ OCR_PROMPT_ZH = r"""
 TRANSLATE_PROMPT_TEMPLATE = r"""
 你是一个专业学术翻译引擎。请把以下内容从 __SRC_LANG__ 翻译到 __DST_LANG__。
 
-严格要求：
+严格要求（必须遵守）：
 - 输入是 JSON，包含 items 列表，每个 item 有 id 和 segments（字符串列表）。
 - 输出必须是 JSON，结构必须为：{"items":[{"id":"...","segments":[...]}, ...]}
+- 输出 JSON 必须可被标准 json.loads 解析。
 - segments 的数量必须与输入完全一致；每个 segments[i] 对应翻译输入 segments[i]。
 - 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{ }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
 - LaTeX 代码、公式环境（如 \begin{equation}...\end{equation} 或 $...$）不得改动。
-- 不要添加多余字段、不要输出解释、不要 Markdown。
+- 只输出 JSON，不要输出解释，不要输出 Markdown，不要输出多余文本。
+""".strip()
+
+# 更强的二次重试提示：明确“禁止保留原文”
+TRANSLATE_PROMPT_STRONG_TEMPLATE = r"""
+你是一个严格的学术翻译引擎。你必须把文本翻译成 __DST_LANG__，禁止保留原文语言（除非是专有名词/缩写）。
+
+输入是 JSON，输出必须是 JSON：
+{"items":[{"id":"...","segments":[...]}, ...]}
+
+硬性要求：
+- 输出必须可被 json.loads 解析，且只能输出一个 JSON 对象。
+- segments 数量必须与输入完全一致。
+- 占位符（__MATH_0__、__KEEP_12__、{{}}）必须原样保留。
+- LaTeX/公式不得改动。
+- 若输入是中文，输出必须明显是 __DST_LANG__（例如英文），不能原样照抄。
 """.strip()
 
 
@@ -95,6 +115,7 @@ DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"
 DEFAULT_OCR_TIMEOUT_S = 120
 DEFAULT_TRANSLATE_TIMEOUT_S = 180
+
 
 def get_api_key() -> str:
     k = None
@@ -387,7 +408,7 @@ def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[in
 
 
 # ============================================================
-# 5) LaTeX code style for OCR result
+# 5) LaTeX style helpers
 # ============================================================
 DISPLAY_MATH_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
 INLINE_MATH_RE = re.compile(r"(?<!\$)\$([^$\n]+)\$(?!\$)")
@@ -414,7 +435,7 @@ def md_to_latex_code_style(md: str) -> str:
 
 
 # ============================================================
-# 6) DOCX translate (preserve layout, best-effort) + equation replacement
+# 6) DOCX translate
 # ============================================================
 MATH_TOKEN_RE = re.compile(
     r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\))",
@@ -448,7 +469,6 @@ def iter_table_paragraphs(table: Table) -> List[Paragraph]:
     return out
 
 def iter_part_paragraphs(part) -> List[Paragraph]:
-    """part: doc, header, footer"""
     ps: List[Paragraph] = []
     try:
         ps.extend(part.paragraphs)
@@ -462,19 +482,12 @@ def iter_part_paragraphs(part) -> List[Paragraph]:
     return ps
 
 def iter_all_paragraphs_extended(doc: Document) -> List[Paragraph]:
-    """
-    ✅ 覆盖：正文 paragraphs + tables + 每个 section 的 header/footer（含表格）
-    仍不覆盖：textbox/shape、批注、脚注尾注（python-docx 限制）
-    """
     ps: List[Paragraph] = []
     ps.extend(iter_part_paragraphs(doc))
-
-    # headers/footers
     try:
         for sec in doc.sections:
             ps.extend(iter_part_paragraphs(sec.header))
             ps.extend(iter_part_paragraphs(sec.footer))
-            # first/even page headers/footers（若存在）
             if hasattr(sec, "first_page_header"):
                 ps.extend(iter_part_paragraphs(sec.first_page_header))
             if hasattr(sec, "first_page_footer"):
@@ -486,73 +499,6 @@ def iter_all_paragraphs_extended(doc: Document) -> List[Paragraph]:
     except Exception:
         pass
     return ps
-
-def extract_math_from_docx_with_pandoc(docx_bytes: bytes) -> List[Tuple[str, str]]:
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        f = td / "in.docx"
-        f.write_bytes(docx_bytes)
-        md = pypandoc.convert_file(str(f), to="markdown", format="docx", extra_args=["--wrap=none"])
-        md = md.replace("\r\n", "\n").replace("\r", "\n")
-
-    matches: List[Tuple[int, int, str, str]] = []
-    for m in re.finditer(r"(?s)\$\$(.+?)\$\$", md):
-        matches.append((m.start(), m.end(), "display", m.group(1).strip()))
-    for m in re.finditer(r"(?<!\$)\$([^$\n]+)\$(?!\$)", md):
-        matches.append((m.start(), m.end(), "inline", m.group(1).strip()))
-    matches.sort(key=lambda x: x[0])
-    return [(k, b) for _, _, k, b in matches]
-
-def insert_text_run_at_paragraph_child(p_elm, idx: int, text: str):
-    r = OxmlElement("w:r")
-    t = OxmlElement("w:t")
-    if text.startswith(" ") or text.endswith(" "):
-        t.set(qn("xml:space"), "preserve")
-    t.text = text
-    r.append(t)
-    p_elm.insert(idx, r)
-
-def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]], use_equation_env: bool = True) -> int:
-    all_ps = iter_all_paragraphs_extended(doc)
-    seq_idx = 0
-    replaced = 0
-
-    for p in all_ps:
-        p_elm = p._p
-        nodes = p_elm.xpath(".//*[local-name()='oMath' or local-name()='oMathPara']")
-        for node in nodes:
-            if seq_idx >= len(math_seq):
-                return replaced
-            kind, body = math_seq[seq_idx]
-            seq_idx += 1
-
-            if use_equation_env:
-                latex_text = (f"\\begin{{equation}} {body} \\end{{equation}}") if kind == "display" else (f"\\({body}\\)")
-            else:
-                latex_text = (f"$$ {body} $$") if kind == "display" else (f"$ {body} $")
-
-            parent = node.getparent()
-            if parent is None:
-                continue
-
-            try:
-                idx_in_parent = list(parent).index(node)
-            except Exception:
-                idx_in_parent = None
-
-            if parent is not p_elm or idx_in_parent is None:
-                insert_text_run_at_paragraph_child(p_elm, len(p_elm), latex_text)
-            else:
-                insert_text_run_at_paragraph_child(parent, idx_in_parent, latex_text)
-
-            try:
-                parent.remove(node)
-            except Exception:
-                pass
-
-            replaced += 1
-
-    return replaced
 
 def chunk_items_for_api(items: List[dict], max_chars: int = 12000) -> List[List[dict]]:
     batches: List[List[dict]] = []
@@ -613,6 +559,61 @@ def extract_json_object(text: str) -> dict:
 
     raise ValueError("no complete JSON object found (unbalanced braces)")
 
+def _schema_validate_translation(input_items: List[dict], obj: dict) -> Dict[str, List[str]]:
+    """严格校验输出 JSON 是否满足 schema，并返回 id->segments。"""
+    if not isinstance(obj, dict):
+        raise ValueError("output is not a JSON object")
+    items_out = obj.get("items", None)
+    if not isinstance(items_out, list):
+        raise ValueError("JSON schema error: items must be a list")
+
+    input_map = {it["id"]: it["segments"] for it in input_items}
+    out: Dict[str, List[str]] = {}
+
+    for it in items_out:
+        if not isinstance(it, dict):
+            raise ValueError("items element is not an object")
+        if "id" not in it or "segments" not in it:
+            raise ValueError("items element missing id/segments")
+        _id = it["id"]
+        segs = it["segments"]
+        if _id not in input_map:
+            # 允许模型输出多余 id 也行，但我们只处理输入 id
+            continue
+        if not isinstance(segs, list) or not all(isinstance(x, str) for x in segs):
+            raise ValueError("segments must be a list of strings")
+        if len(segs) != len(input_map[_id]):
+            raise ValueError(f"segments length mismatch for {_id}: {len(segs)} != {len(input_map[_id])}")
+        out[_id] = segs
+
+    # 确保每个输入 id 都有输出
+    missing = [k for k in input_map.keys() if k not in out]
+    if missing:
+        raise ValueError(f"missing translated items: {missing[:5]} ... total {len(missing)}")
+
+    return out
+
+def _looks_untranslated(orig: str, trans: str) -> bool:
+    """粗略判断：译文是否几乎等于原文（忽略空白）。"""
+    o = re.sub(r"\s+", "", orig or "")
+    t = re.sub(r"\s+", "", trans or "")
+    if not o:
+        return False
+    if o == t:
+        return True
+    # 过高重合也判为可疑（保守）
+    if len(o) > 40:
+        # overlap ratio by common prefix length
+        common = 0
+        for a, b in zip(o, t):
+            if a == b:
+                common += 1
+            else:
+                break
+        if common / max(1, len(o)) > 0.6:
+            return True
+    return False
+
 def doubao_translate_items(
     client: OpenAI,
     model: str,
@@ -620,18 +621,20 @@ def doubao_translate_items(
     src_lang: str,
     dst_lang: str,
     timeout_s: int,
+    debug_raw_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, List[str]]:
     src = "auto-detect" if src_lang == "Auto" else src_lang
-    prompt = (TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src).replace("__DST_LANG__", dst_lang))
+    prompt = TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src).replace("__DST_LANG__", dst_lang)
 
     payload = {"items": items}
     messages = [{"role": "user", "content": prompt + "\n\n" + json.dumps(payload, ensure_ascii=False)}]
 
+    # 翻译建议 temperature=0 更稳
     res = safe_chat_completions(
         client=client,
         model=model,
         messages=messages,
-        temperature=0.2,
+        temperature=0.0,
         max_tokens=8192,
         timeout_s=timeout_s,
         retries=6,
@@ -640,44 +643,74 @@ def doubao_translate_items(
         st.error(f"翻译调用失败：\n\n{res.error_message}")
         st.stop()
 
-    obj = extract_json_object(res.text)
-    out: Dict[str, List[str]] = {}
-    items_out = obj.get("items", [])
-    if not isinstance(items_out, list):
-        raise ValueError("JSON schema error: items must be a list")
-    for it in items_out:
-        out[it["id"]] = it["segments"]
+    raw1 = res.text
+    if debug_raw_cb:
+        debug_raw_cb(raw1)
+
+    # 解析 + schema 校验
+    try:
+        obj = extract_json_object(raw1)
+        out = _schema_validate_translation(items, obj)
+    except Exception as e:
+        # 失败就强提示重试一次
+        strong_prompt = TRANSLATE_PROMPT_STRONG_TEMPLATE.replace("__DST_LANG__", dst_lang)
+        messages2 = [{"role": "user", "content": strong_prompt + "\n\n" + json.dumps(payload, ensure_ascii=False)}]
+        res2 = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=messages2,
+            temperature=0.0,
+            max_tokens=8192,
+            timeout_s=timeout_s,
+            retries=3,
+        )
+        if res2.error_message:
+            st.error(f"翻译重试失败：\n\n{res2.error_message}")
+            st.stop()
+        raw2 = res2.text
+        if debug_raw_cb:
+            debug_raw_cb("\n\n--- RETRY ---\n\n" + raw2)
+
+        obj2 = extract_json_object(raw2)
+        out = _schema_validate_translation(items, obj2)
+
+    # “翻译有效性”检测：如果大量段落完全没变化，则再强制重试一次
+    suspicious = 0
+    for it in items[: min(20, len(items))]:
+        _id = it["id"]
+        orig = it["segments"][0] if it.get("segments") else ""
+        trans = out[_id][0] if _id in out else ""
+        if _looks_untranslated(orig, trans):
+            suspicious += 1
+    if len(items) >= 5 and suspicious >= max(3, len(items[:20]) // 2):
+        # 大概率模型在“照抄”，再强制重试（最强约束）
+        strong_prompt = TRANSLATE_PROMPT_STRONG_TEMPLATE.replace("__DST_LANG__", dst_lang)
+        messages3 = [{"role": "user", "content": strong_prompt + "\n\n" + json.dumps(payload, ensure_ascii=False)}]
+        res3 = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=messages3,
+            temperature=0.0,
+            max_tokens=8192,
+            timeout_s=timeout_s,
+            retries=3,
+        )
+        if not res3.error_message and res3.text:
+            try:
+                obj3 = extract_json_object(res3.text)
+                out3 = _schema_validate_translation(items, obj3)
+                out = out3
+            except Exception:
+                pass
+
     return out
 
-def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min: int = 4000, clamp_max: int = 20000) -> int:
-    """
-    自动分批大小：
-    - 先估 total_json_chars
-    - 再除以 target_batches 得到 max_batch_chars
-    - clamp 到 [clamp_min, clamp_max]
-    """
-    if not items:
-        return 12000
-    total = 0
-    for it in items:
-        total += len(json.dumps(it, ensure_ascii=False))
-    est = int(total / max(1, target_batches))
-    return int(max(clamp_min, min(clamp_max, est)))
-
-
-# ---------------------------
-# Textbox / shape paragraphs (w:txbxContent)
-# ---------------------------
+# Textbox support
 _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 def iter_textbox_paragraph_elements(doc: Document):
-    """
-    python-docx 默认不暴露文本框/形状里的段落。这里直接从 XML 抓取 w:txbxContent 内的 w:p。
-    注意：这能覆盖大量“PDF→DOCX”转换后的文档（文字常被塞进 textbox）。
-    """
     try:
         root = doc.part.element
-        # 仅抓取 textbox 内容
         return root.xpath(".//w:txbxContent//w:p", namespaces=_W_NS)
     except Exception:
         return []
@@ -687,13 +720,8 @@ def get_wt_text(p_elm) -> str:
     return "".join([(t.text or "") for t in ts])
 
 def set_wt_text(p_elm, text: str):
-    """
-    将段落内所有 w:t 合并写回：写入第一个 w:t，其余清空。
-    这会牺牲部分 run 级格式，但能保证“翻译一定发生”。
-    """
     ts = p_elm.xpath(".//w:t", namespaces=_W_NS)
     if not ts:
-        # 没有 w:t 就插一个
         r = OxmlElement("w:r")
         t = OxmlElement("w:t")
         t.text = text
@@ -705,19 +733,10 @@ def set_wt_text(p_elm, text: str):
         t.text = ""
 
 def build_translate_items_paragraph_level(doc: Document):
-    """
-    构建“段落级”翻译 items（更稳），覆盖：
-    - 正文/表格/页眉页脚：用 Paragraph 对象
-    - 文本框/形状：用 XML w:p 元素（w:txbxContent）
-    返回：items, writers
-      - items: [{"id":..., "segments":[...]}]
-      - writers[id] = callable(translated_text)->None
-    """
     items = []
     writers = {}
     pid = 0
 
-    # 1) 普通段落（正文/表格/页眉页脚）
     for p in iter_all_paragraphs_extended(doc):
         full = "".join([r.text or "" for r in p.runs])
         if not full or not full.strip():
@@ -739,10 +758,8 @@ def build_translate_items_paragraph_level(doc: Document):
                 else:
                     paragraph.add_run(out_text)
             return _w
-
         writers[item_id] = _make_writer(p, mp)
 
-    # 2) 文本框段落（w:txbxContent）
     for p_elm in iter_textbox_paragraph_elements(doc):
         full = get_wt_text(p_elm)
         if not full or not full.strip():
@@ -759,7 +776,6 @@ def build_translate_items_paragraph_level(doc: Document):
                 out_text = restore_tokens(out_text, mapping)
                 set_wt_text(par_elm, out_text)
             return _w
-
         writers[item_id] = _make_writer_xml(p_elm, mp)
 
     return items, writers
@@ -774,42 +790,30 @@ def translate_docx_in_place(
     timeout_s: int,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     diagnostic_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    sample_cb: Optional[Callable[[List[Tuple[str, str]]], None]] = None,
+    raw_cb: Optional[Callable[[str], None]] = None,
 ):
-    """
-    ✅ 关键修复：改为“段落级翻译”+ 兼容文本框(w:txbxContent)。
-    这会牺牲部分 run 级格式（加粗/颜色/分段内细粒度样式），但能保证：
-    - 很多 PDF→DOCX 转换出来的“看似文本、实际在 textbox 里”的文档也能被翻译；
-    - run 被切得很碎导致 segments 对齐困难的问题大幅减少。
-    """
     items, writers = build_translate_items_paragraph_level(doc)
 
+    total_chars = sum(len(it["segments"][0]) for it in items if it.get("segments"))
+    contains_tb = any(it["id"].startswith("tb") for it in items)
+
     if diagnostic_cb is not None:
-        # 估算一些统计（用于排错）
-        total_chars = 0
-        for it in items:
-            if it.get("segments"):
-                total_chars += len(it["segments"][0])
         diagnostic_cb({
             "items_built": len(items),
             "estimated_chars": total_chars,
-            "contains_textbox_items": any(it["id"].startswith("tb") for it in items),
+            "contains_textbox_items": contains_tb,
         })
 
     if not items:
-        st.error(
-            "没有抓到任何可翻译文本（items=0）。\n\n"
-            "如果你肉眼看到文档里有文字但这里抓不到，最常见原因是：\n"
-            "1) 文本在图片里（扫描件）；\n"
-            "2) 文本在更特殊的对象里（SmartArt/嵌入对象/批注/脚注等）；\n"
-            "3) 文本被放在无法解析的 shape/textbox 结构中。\n\n"
-            "你可以：\n"
-            "- 走 Tab① 的 OCR（对扫描件最合适）；\n"
-            "- 或在 Word 里把文本框内容复制到正文后再翻译。"
-        )
+        st.error("没有抓到任何可翻译文本（items=0）。扫描件请用 Tab① OCR。")
         return
 
     batches = chunk_items_for_api(items, max_chars=max_batch_chars)
     total = len(batches)
+
+    # 收集样本对照
+    before_after: List[Tuple[str, str]] = []
 
     for bi, batch in enumerate(batches, start=1):
         if progress_cb:
@@ -822,6 +826,7 @@ def translate_docx_in_place(
             src_lang=src_lang,
             dst_lang=dst_lang,
             timeout_s=timeout_s,
+            debug_raw_cb=raw_cb,
         )
 
         for it in batch:
@@ -829,11 +834,16 @@ def translate_docx_in_place(
             segs = translated_map.get(item_id)
             if not segs:
                 continue
-            # 段落级：只取 segments[0]
-            out_text = segs[0] if isinstance(segs, list) and segs else ""
+            out_text = segs[0]
             w = writers.get(item_id)
             if w:
+                # 样本：只记录前几条
+                if len(before_after) < 5:
+                    before_after.append((it["segments"][0], out_text))
                 w(out_text)
+
+    if sample_cb is not None and before_after:
+        sample_cb(before_after)
 
 
 # ============================================================
@@ -846,6 +856,8 @@ def doc_to_bytes(doc: Document) -> bytes:
     return buf.read()
 
 def pandoc_md_to_docx(md: str) -> bytes:
+    if not PANDOC_OK:
+        raise RuntimeError("Pandoc 不可用，无法导出 docx。")
     md = normalize_md(md) + "\n"
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "out.docx"
@@ -877,7 +889,6 @@ def _init_state():
 
 _init_state()
 
-# ✅ 关键修复：在任何 widget 创建之前应用 pending 推荐参数
 if "__pending_rec__" in st.session_state:
     rec = st.session_state.pop("__pending_rec__")
     for k in ["max_side", "tile_h", "overlap", "jpeg_q", "out_tokens"]:
@@ -893,34 +904,16 @@ with st.sidebar:
     st.divider()
     st.subheader("OCR 参数与自动推荐")
 
-    st.selectbox("预设", ["Fast", "Balanced", "Accurate"], key="preset_mode",
-                 help="Fast：更快更省；Accurate：更清晰更稳但更慢；Balanced：折中。")
+    st.selectbox("预设", ["Fast", "Balanced", "Accurate"], key="preset_mode")
 
-    st.slider("Max side（最长边像素）", 800, 3200, key="max_side", step=100,
-              help="大：更清晰更准但更慢更贵；小：更快更省但小字/公式易错。")
-    st.slider("Tile height（切片高度）", 800, 2600, key="tile_h", step=100,
-              help="大：切片少更快但易截断；小：切片多更稳但更慢更贵。")
-    st.slider("Overlap（切片重叠）", 0, 400, key="overlap", step=10,
-              help="大：边界漏字更少但可能重复；小：更快但边界更易漏。")
-    st.slider("JPEG quality（压缩质量）", 50, 95, key="jpeg_q", step=1,
-              help="高：细节更清晰更准但更慢；低：更快但公式/小字更易糊。")
-    st.slider("OCR max tokens（输出上限）", 1024, 8192, key="out_tokens", step=256,
-              help="输出太短会截断漏字。截断优先：减 tile_h；其次：增 tokens。")
+    st.slider("Max side", 800, 3200, key="max_side", step=100)
+    st.slider("Tile height", 800, 2600, key="tile_h", step=100)
+    st.slider("Overlap", 0, 400, key="overlap", step=10)
+    st.slider("JPEG quality", 50, 95, key="jpeg_q", step=1)
+    st.slider("OCR max tokens", 1024, 8192, key="out_tokens", step=256)
 
-    st.number_input("OCR 请求超时（秒）", min_value=30, max_value=600, key="ocr_timeout_s", step=10,
-                    help="大图/网络慢可调到 180-300。")
-    st.number_input("翻译请求超时（秒）", min_value=30, max_value=900, key="translate_timeout_s", step=10,
-                    help="10页以上建议 180-300；更稳可更高。")
-
-    with st.expander("参数速查（给不懂的人）", expanded=False):
-        st.markdown(
-            """
-- **输出经常断在半页**：先把 **Tile height** 调小（1600→1200），再把 **OCR max tokens** 调大（4096→6144）。
-- **速度太慢/切片太多**：把 **Tile height** 调大（1600→2000），再把 **Max side** 略降（2200→1800）。
-- **小字/公式错多**：把 **Max side** 调大（2200→2800+），或 **JPEG** 85→90/95。
-- **翻译大文档更稳**：把 **max_batch_chars** 调小（12000→8000/6000），同时把超时调高（180→300）。
-"""
-        )
+    st.number_input("OCR 超时（秒）", min_value=30, max_value=600, key="ocr_timeout_s", step=10)
+    st.number_input("翻译超时（秒）", min_value=30, max_value=900, key="translate_timeout_s", step=10)
 
 
 # ============================================================
@@ -928,17 +921,16 @@ with st.sidebar:
 # ============================================================
 tabs = st.tabs([
     "① PDF/图片 OCR → 导出",
-    "② Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
-    "③ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
+    "② Word(.docx) → 翻译/公式替换（强校验）",
+    "③ Word(.docx) → LaTeX/Markdown 导出（推荐）",
 ])
 
+
 # ---------------------------
-# Tab 1: OCR (PDF + images)
+# Tab 1: OCR
 # ---------------------------
 with tabs[0]:
     st.subheader("PDF/图片 OCR（带自动参数推荐 + 进度条）")
-    st.write("建议：先上传 1 页代表性页面 → 点“自动推荐参数” → 再批量处理。")
-
     if "__pending_rec_msg__" in st.session_state:
         st.success(st.session_state.pop("__pending_rec_msg__"))
 
@@ -950,16 +942,15 @@ with tabs[0]:
 
     col_pdf = st.columns([1, 1, 2])
     with col_pdf[0]:
-        pdf_dpi = st.selectbox("PDF 渲染 DPI", [200, 300, 400], index=1)
+        pdf_dpi = st.selectbox("PDF DPI", [200, 300, 400], index=1)
     with col_pdf[1]:
         pdf_max_pages = st.number_input("PDF 最多页数（0=不限制）", min_value=0, max_value=500, value=0, step=1)
     with col_pdf[2]:
         if not HAVE_PYMUPDF:
-            st.warning("未检测到 pymupdf，PDF 上传不可用。请 pip install pymupdf")
+            st.warning("未检测到 pymupdf，PDF 上传不可用（pip install pymupdf）。")
 
-    # 先把所有输入转换成 images list
     images: List[Image.Image] = []
-    page_meta: List[str] = []  # for page labeling
+    page_meta: List[str] = []
 
     if files:
         for f in files:
@@ -970,33 +961,26 @@ with tabs[0]:
                     st.error("你上传了 PDF，但环境缺少 pymupdf。请安装后重试：pip install pymupdf")
                     st.stop()
                 pdf_bytes = f.read()
-                try:
-                    imgs = pdf_bytes_to_images(
-                        pdf_bytes,
-                        dpi=int(pdf_dpi),
-                        max_pages=None if int(pdf_max_pages) == 0 else int(pdf_max_pages),
-                    )
-                except Exception as e:
-                    st.error(f"PDF 渲染失败：{e}")
-                    st.stop()
+                imgs = pdf_bytes_to_images(
+                    pdf_bytes,
+                    dpi=int(pdf_dpi),
+                    max_pages=None if int(pdf_max_pages) == 0 else int(pdf_max_pages),
+                )
                 for i, im in enumerate(imgs, start=1):
                     images.append(im)
                     page_meta.append(f"{name} - p{i}")
             else:
-                try:
-                    im = Image.open(f)
-                    images.append(im)
-                    page_meta.append(name)
-                except Exception as e:
-                    st.warning(f"无法读取图片 {name}：{e}")
+                im = Image.open(f)
+                images.append(im)
+                page_meta.append(name)
 
     cols = st.columns([1, 1, 2])
     with cols[0]:
         auto_btn = st.button("🪄 自动推荐参数（基于第1页）", disabled=not images)
     with cols[1]:
-        preset_btn = st.button("🎛️ 应用预设（Fast/Balanced/Accurate）", disabled=not images)
+        preset_btn = st.button("🎛️ 应用预设", disabled=not images)
     with cols[2]:
-        st.caption("自动推荐会根据图片高度与文字/边缘密度估计调整 max_side/tile/overlap/tokens。")
+        st.caption("推荐会根据文字密度/边缘密度估计参数。")
 
     if images and auto_btn:
         rec = recommend_ocr_params(images[0], mode=st.session_state["preset_mode"])
@@ -1008,7 +992,7 @@ with tabs[0]:
         st.session_state["__pending_rec__"] = rec
         st.rerun()
 
-    join_lines = st.checkbox("可选：合并断行（适合 PDF 每行强制换行）", value=False)
+    join_lines = st.checkbox("合并断行（适合 PDF 强制换行）", value=False)
 
     def merge_hard_wraps(md: str) -> str:
         parts = md.split("\n\n")
@@ -1018,7 +1002,7 @@ with tabs[0]:
             if any(l.startswith(("-", "*", "|", "#")) for l in lines):
                 out.append("\n".join(p.splitlines()))
             else:
-                out.append(" ".join([l for l in lines if l != ""]).strip())
+                out.append(" ".join([l for l in lines if l]).strip())
         return "\n\n".join(out).strip()
 
     if st.button("开始 OCR 并导出", type="primary", disabled=not images):
@@ -1033,10 +1017,10 @@ with tabs[0]:
         page_bar = st.progress(0, text="准备 OCR…")
 
         for pi, img in enumerate(images, start=1):
-            tile_bar = st.progress(0, text=f"OCR 第 {pi}/{total_pages} 页：准备切片…")
+            tile_bar = st.progress(0, text=f"OCR {pi}/{total_pages}：准备切片…")
 
             def _tile_cb(cur: int, total: int):
-                tile_bar.progress(int(cur / total * 100), text=f"OCR 第 {pi}/{total_pages} 页：切片 {cur}/{total}")
+                tile_bar.progress(int(cur / total * 100), text=f"OCR {pi}/{total_pages}：切片 {cur}/{total}")
 
             md = ocr_image_to_markdown(
                 client=client,
@@ -1056,121 +1040,97 @@ with tabs[0]:
 
             label = page_meta[pi - 1] if pi - 1 < len(page_meta) else f"Page {pi}"
             pages.append(f"## 第 {pi} 页（{label}）\n\n{md}")
-            page_bar.progress(int(pi / total_pages * 100), text=f"已完成 {pi}/{total_pages} 页")
+            page_bar.progress(int(pi / total_pages * 100), text=f"已完成 {pi}/{total_pages}")
             tile_bar.empty()
 
         merged_md = normalize_md("\n\n---\n\n".join(pages))
 
         st.success("OCR 完成")
-        st.markdown("### 预览（Markdown）")
         st.code(merged_md, language="markdown")
 
-        v1_docx = pandoc_md_to_docx(merged_md)
-        v2_md_bytes = merged_md.encode("utf-8")
+        if PANDOC_OK:
+            v1_docx = pandoc_md_to_docx(merged_md)
+            st.download_button("下载 Rendered.docx", data=v1_docx, file_name="OCR_Rendered.docx")
 
-        v3_md = md_to_latex_code_style(merged_md)
-        v3_docx = pandoc_md_to_docx(v3_md)
-
-        st.download_button("下载 V1：Rendered.docx（pandoc渲染公式）", data=v1_docx, file_name="OCR_Rendered.docx")
-        st.download_button("下载 V2：Result.md（原始 Markdown）", data=v2_md_bytes, file_name="OCR_Result.md")
-        st.download_button("下载 V3：LaTeX_equation_code.docx（公式为 LaTeX 代码块）", data=v3_docx,
-                           file_name="OCR_LaTeX_equation_code.docx")
-        st.download_button("下载 V3：LaTeX_equation_code.md", data=v3_md.encode("utf-8"),
-                           file_name="OCR_LaTeX_equation_code.md")
+        st.download_button("下载 Result.md", data=merged_md.encode("utf-8"), file_name="OCR_Result.md")
 
 
 # ---------------------------
-# Tab 2: DOCX translate + best-effort equation replace
+# Tab 2: DOCX translate
 # ---------------------------
 with tabs[1]:
-    st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
-    st.warning(
-        "说明：Word 可编辑公式（OMML）要“可靠”转 LaTeX，推荐使用 Tab③ 的 Pandoc 直接导出。\n"
-        "本 Tab 的“就地替换公式”为 best-effort，可能出现错位/不全。"
-    )
+    st.subheader("Word(.docx) → 翻译（强校验 + 自动重试）")
+    st.info("如果导出仍然是原文，本页面会显示“原文-译文对照样本”和“是否判定为未翻译”。")
 
     docx_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_inplace")
 
     colA, colB, colC = st.columns([1, 1, 1])
     with colA:
-        do_equation_replace = st.checkbox("把 Word 原生公式（OMML）替换为 LaTeX 代码（best-effort）", value=False)
-        do_translate = st.checkbox("翻译文档（尽量保持原排版）", value=False)
-
+        do_translate = st.checkbox("翻译文档（保持尽量原排版）", value=True)
     with colB:
         src_lang = st.selectbox("源语言", ["Auto", "Chinese", "English", "Japanese", "Korean", "Spanish"], index=0)
-        dst_lang = st.selectbox("目标语言", ["Chinese", "English", "Japanese", "Korean", "Spanish"], index=1)
-
+        dst_lang = st.selectbox("目标语言", ["English", "Chinese", "Japanese", "Korean", "Spanish"], index=0)
     with colC:
-        auto_batch = st.checkbox("自动分批（推荐）", value=True)
-        target_batches = st.number_input("目标批次数（自动分批用）", min_value=1, max_value=50, value=8, step=1)
+        max_batch_chars = st.slider("max_batch_chars", 4000, 20000, 12000, 500)
 
-    if not auto_batch:
-        max_batch_chars = st.slider("翻译分批大小（max_batch_chars）", 4000, 20000, 12000, 500)
-    else:
-        max_batch_chars = 12000  # will be computed after parsing doc
+    show_debug = st.checkbox("显示调试信息（推荐开）", value=True)
 
-    show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
+    if st.button("开始翻译并导出（new.docx）", type="primary", disabled=not docx_file):
+        if src_lang == dst_lang and src_lang != "Auto":
+            st.warning("源语言和目标语言相同，翻译可能看起来“没变化”。")
 
-    if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
         if not st.session_state["model_id"].strip():
             st.error("请先填写 model（ep-xxxx 或模型ID）。")
             st.stop()
 
         client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
-
         doc_bytes = docx_file.read()
         doc = Document(io.BytesIO(doc_bytes))
 
-        if do_equation_replace:
-            with st.spinner("提取公式序列（pandoc）..."):
-                math_seq = extract_math_from_docx_with_pandoc(doc_bytes)
-            with st.spinner("替换 Word 原生公式为 LaTeX 代码（best-effort）..."):
-                replaced_count = replace_omml_with_latex_code(doc, math_seq, use_equation_env=True)
-            st.info(f"已替换公式数量（best-effort）：{replaced_count}")
+        diag_box = st.empty()
+        sample_box = st.empty()
+        raw_box = st.empty()
+
+        diag_payload_holder: Dict[str, Any] = {}
+
+        def _diag_cb(payload: Dict[str, Any]):
+            diag_payload_holder.update(payload)
+            if show_debug:
+                diag_box.info(
+                    f"诊断：items_built={payload.get('items_built')}  "
+                    f"estimated_chars={payload.get('estimated_chars')}  "
+                    f"contains_textbox_items={payload.get('contains_textbox_items')}"
+                )
+
+        def _sample_cb(pairs: List[Tuple[str, str]]):
+            if show_debug and pairs:
+                md_lines = []
+                for i, (o, t) in enumerate(pairs, start=1):
+                    md_lines.append(f"**样本 {i} 原文：** {o[:200]}")
+                    md_lines.append(f"**样本 {i} 译文：** {t[:200]}")
+                    md_lines.append("---")
+                sample_box.markdown("\n\n".join(md_lines))
+
+                # 判定是否“明显没翻译”
+                bad = 0
+                for o, t in pairs:
+                    if _looks_untranslated(o, t):
+                        bad += 1
+                if bad >= max(2, len(pairs)//2):
+                    sample_box.warning("检测到样本译文与原文高度一致：模型可能在照抄（已做自动重试，但仍可能无效）。建议更换翻译模型/EP。")
+
+        raw_snippets: List[str] = []
+        def _raw_cb(raw: str):
+            if show_debug:
+                raw_snippets.append(raw[:1200])
 
         if do_translate:
             batch_bar = st.progress(0, text="准备翻译…")
 
-            diag_box = st.empty()
-
             def _batch_cb(cur: int, total: int):
                 batch_bar.progress(int(cur / total * 100), text=f"翻译批次 {cur}/{total}")
 
-            diag_payload_holder: Dict[str, Any] = {}
-
-            def _diag_cb(payload: Dict[str, Any]):
-                diag_payload_holder.update(payload)
-
-            # 先“预扫描”一次 items 以便自动分批（不重复实现：直接在函数里回调诊断）
-            # 技巧：先调用一次 translate_docx_in_place 之前计算批大小 ——我们需要 items 列表。
-            # 为避免重写大量逻辑，这里用同一套构建逻辑再构建一次 items（轻量）。
-            all_ps = iter_all_paragraphs_extended(doc)
-            items_preview: List[dict] = []
-            pid = 0
-            for p in all_ps:
-                runs = [r for r in p.runs if r.text is not None and r.text != ""]
-                if not runs:
-                    continue
-                segs = []
-                for r in runs:
-                    protected, _ = protect_math(r.text)
-                    segs.append(protected)
-                if not "".join(segs).strip():
-                    continue
-                pid += 1
-                items_preview.append({"id": f"p{pid}", "segments": segs})
-
-            if auto_batch:
-                max_batch_chars = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
-                st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars}")
-
-            if show_translate_diagnostics:
-                diag_box.info(
-                    "诊断将在开始后显示：扫描段落数 / 可翻译 items 数 / runs 数 / 字符数。\n"
-                    "若 items=0，多半是内容在文本框/形状里（python-docx 读不到）。"
-                )
-
-            with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
+            with st.spinner("翻译中…"):
                 translate_docx_in_place(
                     doc=doc,
                     client=client,
@@ -1181,34 +1141,33 @@ with tabs[1]:
                     timeout_s=int(st.session_state["translate_timeout_s"]),
                     progress_cb=_batch_cb,
                     diagnostic_cb=_diag_cb,
+                    sample_cb=_sample_cb,
+                    raw_cb=_raw_cb,
                 )
 
-            if show_translate_diagnostics and diag_payload_holder:
-                diag_box.success(
-                    f"翻译抓取诊断：\n"
-                    f"- items_built           = {diag_payload_holder.get('items_built')}\n"
-                    f"- estimated_chars       = {diag_payload_holder.get('estimated_chars')}\n"
-                    f"- contains_textbox_items= {diag_payload_holder.get('contains_textbox_items')}\n"
-                )
+            if show_debug and raw_snippets:
+                raw_box.code("\n\n====\n\n".join(raw_snippets[:2]), language="text")
 
         out_docx_bytes = doc_to_bytes(doc)
-        st.success("处理完成")
+        st.success("完成")
         st.download_button("下载 new.docx", data=out_docx_bytes, file_name="new.docx")
 
 
 # ---------------------------
-# Tab 3: DOCX -> LaTeX/Markdown export (recommended)
+# Tab 3: DOCX -> LaTeX/Markdown export
 # ---------------------------
 with tabs[2]:
-    st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐：可编辑公式最稳）")
-    st.write("这个模式不追求保留 Word 排版，而追求“学术 LaTeX 输出正确性”，尤其适合大量可编辑公式。")
-
+    st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐）")
     docx_file2 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_export")
 
     out_format = st.selectbox("导出格式", ["latex (.tex)", "markdown (.md)"], index=0)
     wrap_none = st.checkbox("wrap=none（不自动换行）", value=True)
 
     if st.button("导出", type="primary", disabled=not docx_file2):
+        if not PANDOC_OK:
+            st.error("Pandoc 不可用，无法导出。")
+            st.stop()
+
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             in_path = td / "in.docx"
