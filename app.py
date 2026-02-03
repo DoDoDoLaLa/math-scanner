@@ -20,6 +20,8 @@ from PIL import Image, ImageFilter, ImageOps
 
 from openai import OpenAI
 
+
+import httpx
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table
@@ -609,7 +611,7 @@ def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]],
             if use_equation_env:
                 latex_text = (f"\\begin{{equation}} {body} \\end{{equation}}") if kind == "display" else (f"\\({body}\\)")
             else:
-                latex_text = (f"$$ {body} $$") if kind == "display" else (f"$ {body} $")
+                latex_text = (f"$$\n{body}\n$$") if kind == "display" else (f"${body}$")
 
             parent = node.getparent()
             if parent is None:
@@ -1530,39 +1532,41 @@ with tabs[1]:
     show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
 
     if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
-        if not st.session_state["translate_model_id"].strip():
-            st.error("请先填写 model（ep-xxxx 或模型ID）。")
+        if not st.session_state["ocr_model_id"].strip():
+            st.error("请先在侧边栏配置 OCR model（用于 OCR/PDF，不影响翻译）。")
             st.stop()
 
+        # 翻译不依赖侧边栏输入的 translate_model_id（会强制使用 DEFAULT_TRANSLATE_MODEL），
+        # 但这里仍保留输入框，便于你看到当前配置。
         client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
 
         doc_bytes = docx_file.read()
         doc = Document(io.BytesIO(doc_bytes))
 
         # 0) 将文本中的 LaTeX 公式 ($...$ / $$...$$ / \(\) / \[\]) 转成 Word 原生公式（可选）
+        if do_latex_to_omml:
+            if not HAVE_LATEX_OMML:
+                st.error("该功能需要额外依赖：lxml + latex2mathml（见 requirements 更新）。")
+                st.stop()
 
-if do_latex_to_omml:
-    if not HAVE_LATEX_OMML:
-        st.error("该功能需要额外依赖：lxml + latex2mathml（见 requirements 更新）。")
-        st.stop()
+            xsl_cfg = (st.session_state.get("mml2omml_xsl", "") or "").strip()
+            xsl_env = (os.environ.get(DEFAULT_MML2OMML_XSL_ENV, "") or "").strip()
+            xsl_path = xsl_cfg or xsl_env
 
-    # 该功能仅在你提供 MML2OMML.XSL 时启用（Office 自带，Linux 容器通常没有）。
-    xsl_cfg = (st.session_state.get("mml2omml_xsl", "") or "").strip()
-    xsl_env = (os.environ.get(DEFAULT_MML2OMML_XSL_ENV, "") or "").strip()
-    xsl_path = xsl_cfg or xsl_env
-    if not xsl_path:
-        st.warning("未提供 MML2OMML.XSL 路径：已跳过 LaTeX→OMML（不影响翻译/公式导出）。")
-    else:
-        try:
-            converted = convert_inline_latex_to_omml_in_doc(
-                doc,
-                xsl_path=xsl_path,
-                log=lambda s: st.info(s),
-            )
-            st.success(f"LaTeX→OMML 转换完成：{converted} 处")
-        except Exception as e:
-            st.warning(f"LaTeX→OMML 转换失败（已跳过，不影响后续）：{type(e).__name__}: {e}")
+            if not xsl_path:
+                st.warning("未提供 MML2OMML.XSL 路径：已跳过 LaTeX→OMML（不影响翻译/公式导出）。")
+            else:
+                try:
+                    converted = convert_inline_latex_to_omml_in_doc(
+                        doc,
+                        xsl_path=xsl_path,
+                        log=lambda s: st.info(s),
+                    )
+                    st.success(f"LaTeX→OMML 转换完成：{converted} 处")
+                except Exception as e:
+                    st.warning(f"LaTeX→OMML 转换失败（已跳过，不影响后续）：{type(e).__name__}: {e}")
 
+        # 1) 把 Word 原生公式（OMML）替换为 Pandoc 可渲染的 LaTeX（$...$ / $$...$$）
         if do_equation_replace:
             with st.spinner("提取公式序列（pandoc）..."):
                 math_seq = extract_math_from_docx_with_pandoc(doc_bytes)
@@ -1570,9 +1574,9 @@ if do_latex_to_omml:
                 replaced_count = replace_omml_with_latex_code(doc, math_seq, use_equation_env=False)
             st.info(f"已替换公式数量（best-effort）：{replaced_count}")
 
+        # 2) 翻译（保持原排版：仅替换 runs 的文本；图片/表格结构不动）
         if do_translate:
             batch_bar = st.progress(0, text="准备翻译…")
-
             diag_box = st.empty()
             attempt_box = st.empty()
 
@@ -1584,9 +1588,7 @@ if do_latex_to_omml:
             def _diag_cb(payload: Dict[str, Any]):
                 diag_payload_holder.update(payload)
 
-            # 先“预扫描”一次 items 以便自动分批（不重复实现：直接在函数里回调诊断）
-            # 技巧：先调用一次 translate_docx_in_place 之前计算批大小 ——我们需要 items 列表。
-            # 为避免重写大量逻辑，这里用同一套构建逻辑再构建一次 items（轻量）。
+            # 预扫描一次 items 用于“自动分批”估算
             all_ps = iter_all_paragraphs_extended(doc)
             items_preview: List[dict] = []
             pid = 0
@@ -1604,8 +1606,10 @@ if do_latex_to_omml:
                 items_preview.append({"id": f"p{pid}", "segments": segs})
 
             if auto_batch:
-                max_batch_chars = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
-                st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars}")
+                max_batch_chars_local = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
+                st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars_local}")
+            else:
+                max_batch_chars_local = int(max_batch_chars)
 
             if show_translate_diagnostics:
                 diag_box.info(
@@ -1617,10 +1621,10 @@ if do_latex_to_omml:
                 translate_docx_in_place(
                     doc=doc,
                     client=client,
-                    model=st.session_state["translate_model_id"].strip(),
+                    model=st.session_state.get("translate_model_id", "").strip(),
                     src_lang=src_lang,
                     dst_lang=dst_lang,
-                    max_batch_chars=int(max_batch_chars),
+                    max_batch_chars=int(max_batch_chars_local),
                     timeout_s=int(st.session_state["translate_timeout_s"]),
                     progress_cb=_batch_cb,
                     diagnostic_cb=_diag_cb,
