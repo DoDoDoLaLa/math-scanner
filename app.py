@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import io
@@ -24,7 +24,6 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 import pypandoc
-
 # PDF rendering (optional but recommended)
 try:
     import fitz  # PyMuPDF
