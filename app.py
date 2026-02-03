@@ -9,8 +9,6 @@ import time
 import base64
 import tempfile
 import concurrent.futures
-from functools import lru_cache
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
@@ -20,21 +18,16 @@ from PIL import Image, ImageFilter, ImageOps
 
 from openai import OpenAI
 
+import httpx
+
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table
-from docx.oxml import OxmlElement, parse_xml
+from docx.oxml import OxmlElement
+from docx.oxml import parse_xml
 from docx.oxml.ns import qn
 
 import pypandoc
-
-# LaTeX-in-text -> Word equation (OMML) support (optional)
-try:
-    from lxml import etree  # type: ignore
-    import latex2mathml.converter  # type: ignore
-    HAVE_LATEX_OMML = True
-except Exception:
-    HAVE_LATEX_OMML = False
 
 # PDF rendering (optional but recommended)
 try:
@@ -102,27 +95,8 @@ class ArkResult:
     text: str = ""
     error_message: Optional[str] = None
 
-
-class TranslateCallError(RuntimeError):
-    """Raised when a translate call fails or returns invalid JSON schema."""
-    def __init__(self, message: str, raw: Optional[str] = None):
-        super().__init__(message)
-        self.raw = raw
-
-
-def sanitize_errmsg(msg: str) -> str:
-    if not msg:
-        return ""
-    # hide any accidental secrets
-    msg = re.sub(r"(ARK_API_KEY\s*=\s*)[A-Za-z0-9_\-\.]+", r"\1***", msg)
-    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1***", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"sk-[A-Za-z0-9]{10,}", "sk-***", msg)
-    return msg
-
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_ARK_MODEL = "ep-20260203141749-992fx"
-DEFAULT_TRANSLATE_MODEL = "ep-20260203211039-n9v2f"  # dedicated translate endpoint
-DEFAULT_MML2OMML_XSL_ENV = "MML2OMML_XSL"  # path to MML2OMML.XSL
 DEFAULT_OCR_TIMEOUT_S = 120
 DEFAULT_TRANSLATE_TIMEOUT_S = 180
 
@@ -203,6 +177,108 @@ def safe_chat_completions(
     t0 = time.time()
     last_err: Any = None
 
+
+# --- Ark Responses API translation (for doubao-seed-translation / translation EP) ---
+# The translation model is invoked via POST {base_url}/responses with input_text.translation_options.
+# Example (from Volcengine/Ark docs mirrored in community):
+#   https://ark.cn-beijing.volces.com/api/v3/responses
+# See: https://github.com/buxuku/SmartSub/issues/236
+
+LANG_CODE_MAP = {
+    "Auto": "",
+    "Chinese": "zh",
+    "Chinese (simplified)": "zh",
+    "English": "en",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "German": "de",
+    "French": "fr",
+    "Spanish": "es",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "Thai": "th",
+    "Vietnamese": "vi",
+    "Arabic": "ar",
+}
+
+def _to_lang_code(x: str) -> str:
+    x = (x or "").strip()
+    if x in LANG_CODE_MAP:
+        return LANG_CODE_MAP[x]
+    # if user already provided a code like 'zh-Hant'
+    if re.fullmatch(r"[a-z]{2}(-[A-Za-z]+)?", x):
+        return x
+    return x[:2].lower() if x else ""
+
+def ark_responses_translate_text(
+    model: str,
+    text: str,
+    src_lang: str,
+    dst_lang: str,
+    timeout_s: int,
+) -> str:
+    api_key = get_api_key()
+    base_url = get_ark_base_url().rstrip("/")
+    url = base_url + "/responses"
+    dst = _to_lang_code(dst_lang)
+    src = _to_lang_code(src_lang)
+
+    content_obj: Dict[str, Any] = {"type": "input_text", "text": text, "translation_options": {"target_language": dst}}
+    if src:
+        content_obj["translation_options"]["source_language"] = src
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [content_obj],
+            }
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    with httpx.Client(timeout=timeout_s) as hc:
+        r = hc.post(url, headers=headers, json=payload)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Ark /responses HTTP {r.status_code}: {r.text[:2000]}")
+        obj = r.json()
+
+    # Robust text extraction across common Responses shapes
+    if isinstance(obj, dict):
+        if isinstance(obj.get("output_text"), str) and obj["output_text"].strip():
+            return obj["output_text"].strip()
+
+        out = obj.get("output")
+        if isinstance(out, list):
+            texts = []
+            for item in out:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict):
+                            if isinstance(c.get("text"), str):
+                                texts.append(c["text"])
+                            elif isinstance(c.get("content"), str):
+                                texts.append(c["content"])
+            if texts:
+                return "".join(texts).strip()
+
+        # fallback to chat-like
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message", {})
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"].strip()
+
+    raise RuntimeError(f"Unexpected /responses shape: keys={list(obj.keys()) if isinstance(obj, dict) else type(obj)}")
     for attempt in range(1, retries + 1):
         if total_timeout_s is not None and (time.time() - t0) > float(total_timeout_s):
             return ArkResult(text="", error_message=f"overall timeout after {total_timeout_s}s (last_err={last_err})")
@@ -507,10 +583,149 @@ def md_to_latex_code_style(md: str) -> str:
 # 6) DOCX translate (preserve layout, best-effort) + equation replacement
 # ============================================================
 MATH_TOKEN_RE = re.compile(
-    r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\))",
+    r"(\$\$.*?\$\$|\$[^$\n]+\$|\\begin\{equation\}.*?\\end\{equation\}|\\\(.+?\\\)|\\\\\\[.+?\\\\\\])",
     re.DOTALL
 )
 
+
+# --- Pandoc: math token -> Word editable equation (OMML) ---
+# Pandoc docx output uses OMML for math. This works on Streamlit Cloud (no Office / no MML2OMML.XSL needed).
+# Math delimiter behavior is defined by pandoc extensions such as tex_math_dollars / tex_math_single_backslash / tex_math_double_backslash.
+# See: https://pandoc.org/demo/example33/8.13-math.html
+
+@st.cache_resource(show_spinner=False)
+def _pandoc_version() -> str:
+    try:
+        return str(pypandoc.get_pandoc_version())
+    except Exception:
+        return ""
+
+def _ensure_pandoc_ok():
+    ver = _pandoc_version()
+    if not ver:
+        raise RuntimeError("Pandoc not available. Add pypandoc-binary to requirements.txt and redeploy.")
+
+def _canon_math_token(token: str) -> Tuple[str, bool]:
+    t = token.strip()
+    if t.startswith("$$") and t.endswith("$$"):
+        body = t[2:-2].strip()
+        return f"$$\n{body}\n$$", True
+    if t.startswith("$") and t.endswith("$"):
+        body = t[1:-1].strip()
+        return f"${body}$", False
+    if t.startswith(r"\(") and t.endswith(r"\)"):
+        body = t[2:-2].strip()
+        return r"\(" + body + r"\)", False
+    if t.startswith(r"\[") and t.endswith(r"\]"):
+        body = t[2:-2].strip()
+        return r"\[" + body + r"\]", True
+    # keep as-is
+    return t, False
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def pandoc_math_to_omml_xml(token: str) -> str:
+    """
+    Convert ONE math token ($...$, $$...$$, \(..\), \[..\]) to OMML xml string by:
+      markdown(+tex_math_*) -> docx (pandoc) -> extract first oMath/oMathPara XML.
+    Cached for speed.
+    """
+    _ensure_pandoc_ok()
+    canonical, is_block = _canon_math_token(token)
+
+    fmt = "markdown+tex_math_dollars+tex_math_single_backslash+tex_math_double_backslash"
+    md = canonical + ("\n\n" if is_block else "\n")
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "eq.docx"
+        pypandoc.convert_text(md, to="docx", format=fmt, outputfile=str(out))
+        d = Document(str(out))
+        for p in d.paragraphs:
+            nodes = p._p.xpath(".//*[local-name()='oMath' or local-name()='oMathPara']")
+            if nodes:
+                return nodes[0].xml
+
+    raise RuntimeError("Pandoc did not emit OMML for this token; check delimiters/latex.")
+
+def _build_run_index_map(paragraph: Paragraph) -> Tuple[str, List[Tuple[int, int]]]:
+    """
+    Return (full_text, pos_map) where pos_map[i] = (run_idx, offset_in_run) for each char position.
+    """
+    runs = paragraph.runs
+    parts = []
+    pos_map: List[Tuple[int, int]] = []
+    for ri, r in enumerate(runs):
+        txt = r.text or ""
+        parts.append(txt)
+        for oi, _ch in enumerate(txt):
+            pos_map.append((ri, oi))
+    return "".join(parts), pos_map
+
+def convert_inline_latex_tokens_to_omml_in_doc(doc: Document, log: Optional[Callable[[str], None]] = None) -> int:
+    """
+    Find inline math tokens in paragraph text (across runs), replace with OMML.
+    Works for tokens: $...$, $$...$$, \(..\), \[..\] (best-effort).
+    """
+    _ensure_pandoc_ok()
+    converted = 0
+    all_ps = iter_all_paragraphs_extended(doc)
+
+    for p in all_ps:
+        # quick skip
+        full_text = "".join((r.text or "") for r in p.runs)
+        if not full_text:
+            continue
+        if not MATH_TOKEN_RE.search(full_text):
+            continue
+
+        # Build mapping char->(run,offset)
+        full_text, pos_map = _build_run_index_map(p)
+        matches = list(MATH_TOKEN_RE.finditer(full_text))
+        if not matches:
+            continue
+
+        # Replace from end to start to keep indices stable
+        for m in reversed(matches):
+            token = m.group(0)
+            try:
+                omml_xml = pandoc_math_to_omml_xml(token)
+            except Exception as e:
+                if log:
+                    log(f"公式转换失败（跳过）：{type(e).__name__}: {e} | expr={token}")
+                continue
+
+            s, epos = m.start(), m.end()
+            if s >= len(pos_map) or epos - 1 >= len(pos_map):
+                continue
+            s_run, s_off = pos_map[s]
+            e_run, e_off = pos_map[epos - 1]
+
+            runs = p.runs
+            # Compute before/after strings
+            before = (runs[s_run].text or "")[:s_off]
+            after = (runs[e_run].text or "")[e_off + 1:]
+
+            # Set start run text to before
+            runs[s_run].text = before
+
+            # Clear middle runs and end run
+            for ri in range(s_run + 1, e_run + 1):
+                runs[ri].text = ""
+
+            # Insert OMML right after start run
+            omml = parse_xml(omml_xml)
+            runs[s_run]._r.addnext(omml)
+
+            # Insert after-text run right after OMML (if needed)
+            if after:
+                new_r = OxmlElement("w:r")
+                new_t = OxmlElement("w:t")
+                new_t.text = after
+                new_r.append(new_t)
+                omml.addnext(new_r)
+
+            converted += 1
+
+    return converted
 def protect_math(text: str) -> Tuple[str, Dict[str, str]]:
     mapping: Dict[str, str] = {}
     k = 0
@@ -644,355 +859,6 @@ def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]],
 
     return replaced
 
-
-
-# --- pandoc-based LaTeX -> OMML (works on Streamlit Cloud; no Office needed) ---
-LATEX_SYMBOL_MAP = {
-    "Δ": r"\Delta",
-    "δ": r"\delta",
-    "ρ": r"\rho",
-    "π": r"\pi",
-    "ϕ": r"\phi",
-    "φ": r"\phi",
-    "α": r"\alpha",
-    "β": r"\beta",
-    "γ": r"\gamma",
-    "λ": r"\lambda",
-    "Λ": r"\Lambda",
-    "∈": r"\in",
-    "≤": r"\le",
-    "≥": r"\ge",
-    "×": r"\times",
-    "·": r"\cdot",
-}
-
-def _cleanup_math_text(s: str) -> str:
-    # remove zero-width chars and normalize whitespace/newlines inside math token
-    if s is None:
-        return ""
-    s = s.replace("\ufeff", "").replace("\u200b", "")
-    # collapse whitespace to single space, then strip spaces around punctuation for compact math
-    s = re.sub(r"\s+", " ", s).strip()
-    # tighten common patterns
-    s = s.replace(" (", "(").replace("( ", "(").replace(" )", ")")
-    s = s.replace(" [", "[").replace("[ ", "[").replace(" ]", "]")
-    s = s.replace(" ,", ",")
-    return s
-
-def _apply_symbol_map(s: str) -> str:
-    # replace unicode math symbols with LaTeX commands (best-effort)
-    for k, v in LATEX_SYMBOL_MAP.items():
-        s = s.replace(k, v)
-    return s
-
-@lru_cache(maxsize=256)
-def _pandoc_latex_to_omml_xml(latex_body: str, is_block: bool) -> str:
-    """
-    Convert a single LaTeX math expression to OMML using pandoc.
-    Returns OMML XML string (the <m:oMath> or <m:oMathPara> element).
-    """
-    latex_body = _apply_symbol_map(_cleanup_math_text(latex_body))
-    if not latex_body:
-        raise RuntimeError("empty math body")
-
-    # Build minimal markdown that pandoc can convert into docx with native equations
-    if is_block:
-        md = "$$\n" + latex_body + "\n$$\n"
-    else:
-        md = "$" + latex_body + "$\n"
-
-    with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "eq.docx"
-        fmt = "markdown+tex_math_dollars"
-        pypandoc.convert_text(md, to="docx", format=fmt, outputfile=str(out))
-        d = Document(str(out))
-        # Find first OMML node
-        nodes = []
-        for p in d.paragraphs:
-            nodes = p._p.xpath(".//*[local-name()='oMath' or local-name()='oMathPara']")
-            if nodes:
-                break
-        if not nodes:
-            # Sometimes pandoc may output literal $...$ if math extension not active
-            raise RuntimeError("pandoc did not emit OMML for this expression")
-        # Serialize this OMML node and return
-        node = nodes[0]
-        return node.xml
-
-def latex_to_omml_element_via_pandoc(latex_expr: str) -> Tuple[OxmlElement, bool]:
-    body, is_block = _strip_latex_delims(latex_expr)
-    xml = _pandoc_latex_to_omml_xml(body, is_block=is_block)
-    return parse_xml(xml), is_block
-
-def latex_body_to_omml_element_via_pandoc(latex_body: str, is_block: bool) -> OxmlElement:
-    xml = _pandoc_latex_to_omml_xml(latex_body, is_block=is_block)
-    return parse_xml(xml)
-
-
-# ---------------------------
-# LaTeX ($...$ / $$...$$ / \(..\) / \[..]) -> Word equation (OMML)
-# ---------------------------
-LATEX_INLINE_RE = re.compile(
-    r"(\$\$.*?\$\$|\$[^$\n]+\$|\\\(.+?\\\)|\\\[.+?\\\])",
-    re.DOTALL,
-)
-
-def _strip_latex_delims(s: str) -> Tuple[str, bool]:
-    s = s.strip()
-    if s.startswith("$$") and s.endswith("$$"):
-        return s[2:-2].strip(), True
-    if s.startswith("$") and s.endswith("$"):
-        return s[1:-1].strip(), False
-    if s.startswith(r"\(") and s.endswith(r"\)"):
-        return s[2:-2].strip(), False
-    if s.startswith(r"\[") and s.endswith(r"\]"):
-        return s[2:-2].strip(), True
-    return s, False
-
-def _guess_office_mml2omml_paths() -> List[str]:
-    # Common installs; user can override via sidebar/env.
-    return [
-        r"C:\Program Files\Microsoft Office\root\Office16\MML2OMML.XSL",
-        r"C:\Program Files (x86)\Microsoft Office\root\Office16\MML2OMML.XSL",
-        r"C:\Program Files\Microsoft Office\Office16\MML2OMML.XSL",
-        r"C:\Program Files (x86)\Microsoft Office\Office16\MML2OMML.XSL",
-    ]
-
-@lru_cache(maxsize=1)
-def _load_mml2omml_xslt(xsl_path: str):
-    if not HAVE_LATEX_OMML:
-        raise RuntimeError("Missing deps: lxml / latex2mathml")
-    if not xsl_path:
-        # try guess
-        for p in _guess_office_mml2omml_paths():
-            if os.path.exists(p):
-                xsl_path = p
-                break
-    if not xsl_path or not os.path.exists(xsl_path):
-        raise RuntimeError(
-            "MML2OMML.XSL not found. Provide its path in sidebar (or env MML2OMML_XSL)."
-        )
-    xslt_doc = etree.parse(xsl_path)
-    return etree.XSLT(xslt_doc)
-
-def latex_to_omml_element(latex_expr: str, xsl_path: str):
-    """Return an OMML element for insertion into docx XML.
-
-    Priority:
-    1) If MML2OMML.XSL is available (local Office install), use latex2mathml + XSLT.
-    2) Otherwise (e.g., Streamlit Cloud), fallback to pandoc snippet conversion (no Office needed).
-    """
-    # Fallback path (works on Streamlit Cloud)
-    if not xsl_path or (not os.path.exists(xsl_path)):
-        return latex_to_omml_element_via_pandoc(latex_expr)
-
-    # XSLT path (requires local Office's MML2OMML.XSL + deps)
-    if not HAVE_LATEX_OMML:
-        # even if deps missing, we can still fallback to pandoc
-        return latex_to_omml_element_via_pandoc(latex_expr)
-
-    body, is_block = _strip_latex_delims(latex_expr)
-    mml = latex2mathml.converter.convert(_apply_symbol_map(_cleanup_math_text(body)))
-    mml = re.sub(r"\s+", " ", mml).strip()
-    mml_root = etree.fromstring(mml.encode("utf-8"))
-    xslt = _load_mml2omml_xslt(xsl_path)
-    omml_tree = xslt(mml_root)
-    omml_root = omml_tree.getroot()
-    return omml_root, is_block
-
-
-
-
-def _clone_rPr(src_r):
-    # clone run properties to keep styling for newly inserted text runs
-    rpr = src_r.find(qn("w:rPr"))
-    if rpr is None:
-        return None
-    return deepcopy(rpr)
-
-def convert_inline_latex_to_omml_in_doc(doc: Document, xsl_path: str, log: Optional[Callable[[str], None]] = None) -> int:
-    """Best-effort: convert LaTeX math delimited with $...$ etc into OMML equations inside a docx.
-
-    Limitations:
-    - Only detects math fully contained inside a single run.
-    - Keeps paragraph structure; tries to preserve run formatting for surrounding text.
-    """
-    if not HAVE_LATEX_OMML:
-        raise RuntimeError("Missing deps: lxml / latex2mathml")
-    converted = 0
-    all_ps = iter_all_paragraphs_extended(doc)
-    for p in all_ps:
-        # iterate by underlying XML runs to allow insertion
-        r_elems = list(p._p.findall(qn("w:r")))
-        for r in r_elems:
-            t = r.find(qn("w:t"))
-            if t is None or not t.text:
-                continue
-            text = t.text
-            # find first match (one per run; iterate after mutation)
-            m = LATEX_INLINE_RE.search(text)
-            if not m:
-                continue
-            before = text[:m.start()]
-            expr = m.group(0)
-            after = text[m.end():]
-
-            try:
-                omml_elem, _is_block = latex_to_omml_element(expr, xsl_path)
-            except Exception as e:
-                if log:
-                    log(f"公式转换失败（跳过）：{type(e).__name__}: {e} | expr={expr[:80]}")
-                continue
-
-            # Replace current run text with "before"
-            t.text = before
-
-            # Insert OMML element right after this run
-            # Note: OMML uses its own namespace (m:). etree element is fine to append.
-            r.addnext(omml_elem)
-
-            # Insert "after" as a new run, trying to keep same rPr
-            if after:
-                new_r = OxmlElement("w:r")
-                rpr_clone = _clone_rPr(r)
-                if rpr_clone is not None:
-                    new_r.append(rpr_clone)
-                new_t = OxmlElement("w:t")
-                new_t.text = after
-                new_r.append(new_t)
-                omml_elem.addnext(new_r)
-
-            converted += 1
-    return converted
-
-
-
-def convert_runs_with_subsup_to_omml_in_doc(
-    doc: Document,
-    log: Optional[Callable[[str], None]] = None,
-    max_group_chars: int = 80,
-) -> int:
-    """
-    Convert sequences of runs that use Word's subscript/superscript formatting into a single OMML equation,
-    using pandoc snippet conversion (works on Streamlit Cloud).
-
-    This targets cases like:
-      Run("P", normal) + Run("c", subscript) + Run("(t)", normal)  ->  OMML for "P_{c}(t)"
-
-    Best-effort rules:
-    - Only groups consecutive runs without whitespace.
-    - Group must contain at least one subscript/superscript run.
-    - Group total text length is capped to avoid pathological conversions.
-    """
-    converted = 0
-    all_ps = iter_all_paragraphs_extended(doc)
-
-    for p in all_ps:
-        runs = list(p.runs)
-        i = 0
-        while i < len(runs):
-            r0 = runs[i]
-            # skip empty
-            if not (r0.text or "").strip():
-                i += 1
-                continue
-
-            # build a candidate group starting at i
-            group = []
-            has_subsup = False
-            total_chars = 0
-            j = i
-            while j < len(runs):
-                rj = runs[j]
-                t = (rj.text or "")
-                if not t:
-                    break
-                # stop at whitespace boundaries
-                if re.search(r"\s", t):
-                    break
-                group.append(rj)
-                total_chars += len(t)
-                f = rj.font
-                if getattr(f, "subscript", False) or getattr(f, "superscript", False):
-                    has_subsup = True
-                if total_chars > max_group_chars:
-                    break
-                j += 1
-
-            if not group or not has_subsup or total_chars > max_group_chars:
-                i += 1
-                continue
-
-            # Build LaTeX body from runs
-            latex_body_parts = []
-            for gr in group:
-                t = _cleanup_math_text(gr.text or "")
-                t = _apply_symbol_map(t)
-                # escape underscores in normal text (avoid accidental subscripts)
-                # but keep braces/backslashes if present (rare here)
-                f = gr.font
-                if getattr(f, "subscript", False):
-                    latex_body_parts.append("_{%s}" % t)
-                elif getattr(f, "superscript", False):
-                    latex_body_parts.append("^{%s}" % t)
-                else:
-                    latex_body_parts.append(t.replace("_", r"\_"))
-            latex_body = "".join(latex_body_parts).strip()
-            if not latex_body:
-                i += 1
-                continue
-
-            try:
-                omml = latex_body_to_omml_element_via_pandoc(latex_body, is_block=False)
-            except Exception as e:
-                if log:
-                    log(f"下标/上标组装公式转换失败（跳过）：{type(e).__name__}: {e} | expr={latex_body[:80]}")
-                i += 1
-                continue
-
-            # Replace the whole group with: [before=empty in first run] + [omml] + [after=empty]
-            try:
-                # clear first run text
-                group[0].text = ""
-                anchor = group[0]._r
-                anchor.addnext(omml)
-                # remove the rest runs in XML
-                for gr in group[1:]:
-                    try:
-                        gr._r.getparent().remove(gr._r)
-                    except Exception:
-                        pass
-                converted += 1
-                # refresh runs list (python-docx caches)
-                runs = list(p.runs)
-                # continue after inserted OMML (roughly at i+1)
-                i = min(i + 1, len(runs))
-            except Exception as e:
-                if log:
-                    log(f"插入 OMML 失败（跳过）：{type(e).__name__}: {e} | expr={latex_body[:80]}")
-                i += 1
-
-    return converted
-
-def convert_math_to_omml_in_doc(
-    doc: Document,
-    xsl_path: str,
-    log: Optional[Callable[[str], None]] = None,
-) -> Dict[str, int]:
-    """
-    One-shot conversion:
-    1) Convert $...$/$$...$$/\\(\\)/\\[\\] math inside text runs -> OMML
-    2) Convert subscript/superscript formatted run groups -> OMML
-
-    Returns counts.
-    """
-    c1 = convert_inline_latex_to_omml_in_doc(doc, xsl_path=xsl_path, log=log)
-    c2 = convert_runs_with_subsup_to_omml_in_doc(doc, log=log)
-    return {"inline_latex": c1, "subsup_groups": c2}
-
-
-
-
 def chunk_items_for_api(items: List[dict], max_chars: int = 12000) -> List[List[dict]]:
     batches: List[List[dict]] = []
     cur: List[dict] = []
@@ -1069,6 +935,37 @@ def doubao_translate_items(
     - 优先尝试 response_format=json_object（若 Ark 端支持），不支持则自动回退
     - 解析失败时，把原始输出（前若干字符）展示出来，便于定位到底卡在“请求/返回/解析”
     """
+
+    # If this is a dedicated translation model / EP, use Ark Responses API (translation_options),
+    # which is the official calling pattern for doubao-seed-translation.
+    # (Calling it via chat.completions often fails or returns non-JSON.)
+    model_l = (model or "").lower()
+    if ("seed-translation" in model_l) or model_l.startswith("ep-") or model_l.startswith("doubao-seed-translation"):
+        out: Dict[str, List[str]] = {}
+        for it in items:
+            _id = it.get("id")
+            segs = it.get("segments", [])
+            if not _id or not isinstance(segs, list):
+                continue
+            out_segs: List[str] = []
+            for s in segs:
+                if not isinstance(s, str) or not s.strip():
+                    out_segs.append(s if isinstance(s, str) else "")
+                    continue
+                try:
+                    tr = ark_responses_translate_text(model=model, text=s, src_lang=src_lang, dst_lang=dst_lang, timeout_s=timeout_s)
+                except Exception as e:
+                    st.error(f"翻译调用失败（/responses）：{type(e).__name__}: {e}")
+                    st.stop()
+                out_segs.append(tr)
+            out[_id] = out_segs
+
+        missing = [x["id"] for x in items if x.get("id") not in out]
+        if missing:
+            st.error(f"翻译输出缺失 items：{missing[:5]} ... total {len(missing)}")
+            st.stop()
+        return out
+
     src = "auto-detect" if src_lang == "Auto" else src_lang
     prompt = TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src).replace("__DST_LANG__", dst_lang)
 
@@ -1095,21 +992,38 @@ def doubao_translate_items(
     )
 
     if res.error_message:
-        raise TranslateCallError(res.error_message, raw=None)
+        st.error(f"翻译调用失败：\n\n{res.error_message}")
+        st.stop()
 
     raw = (res.text or "").strip()
     if debug_sink:
         debug_sink(raw)
-    # 解析 JSON（失败时抛出，交由上层做自适应拆分）
+
+    # 解析 JSON（失败时把 raw 打出来）
     try:
         obj = extract_json_object(raw)
     except Exception as e:
-        raise TranslateCallError(f"invalid JSON: {type(e).__name__}: {e}", raw=raw)
+        st.error(f"翻译返回无法解析为 JSON：{type(e).__name__}: {e}")
+        with st.expander("查看模型原始输出（用于排错）", expanded=True):
+            st.code(raw[:8000] if raw else "<empty>", language="text")
+        # 额外给一个下载按钮，便于你把完整 raw 发给我
+        try:
+            st.download_button(
+                "下载 raw_response.txt（发给我定位）",
+                data=(raw or "").encode("utf-8"),
+                file_name="raw_response.txt",
+            )
+        except Exception:
+            pass
+        st.stop()
 
     out: Dict[str, List[str]] = {}
     items_out = obj.get("items", [])
     if not isinstance(items_out, list):
-        raise TranslateCallError("JSON schema error: items must be a list", raw=json.dumps(obj, ensure_ascii=False))
+        st.error("JSON schema error: items must be a list")
+        with st.expander("解析到的 JSON（前 2000 字符）", expanded=True):
+            st.code(json.dumps(obj, ensure_ascii=False, indent=2)[:2000], language="json")
+        st.stop()
 
     for it in items_out:
         if not isinstance(it, dict) or "id" not in it or "segments" not in it:
@@ -1123,7 +1037,10 @@ def doubao_translate_items(
     # 兜底：如果缺失某些 id，直接报出来（这类问题也会导致“看起来卡住/不前进”）
     missing = [x["id"] for x in items if x.get("id") not in out]
     if missing:
-        raise TranslateCallError(f"missing item ids: {missing[:5]} ... total {len(missing)}", raw=raw)
+        st.error(f"翻译输出缺失 items：{missing[:5]} ... total {len(missing)}")
+        with st.expander("模型原始输出（用于排错）", expanded=True):
+            st.code(raw[:8000] if raw else "<empty>", language="text")
+        st.stop()
 
     return out
 
@@ -1142,58 +1059,6 @@ def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min:
         total += len(json.dumps(it, ensure_ascii=False))
     est = int(total / max(1, target_batches))
     return int(max(clamp_min, min(clamp_max, est)))
-
-
-def translate_items_adaptive(
-    client: OpenAI,
-    model: str,
-    items: List[dict],
-    src_lang: str,
-    dst_lang: str,
-    timeout_s: int,
-    on_attempt: Optional[Callable[[int, int, str], None]] = None,
-    debug_sink: Optional[Callable[[str], None]] = None,
-    max_depth: int = 10,
-) -> Dict[str, List[str]]:
-    """Translate with automatic batch splitting on timeout/invalid JSON.
-
-    This is the main fix for “small text works, large text times out / hangs”.
-    Strategy:
-    - Try translating the batch as-is.
-    - If it fails (timeout, rate-limit, invalid JSON), split the batch into halves and retry.
-    - Merge results. Stops splitting when batch has 1 item or max_depth reached.
-    """
-    if not items:
-        return {}
-    try:
-        return doubao_translate_items(
-            client=client,
-            model=model,
-            items=items,
-            src_lang=src_lang,
-            dst_lang=dst_lang,
-            timeout_s=timeout_s,
-            on_attempt=on_attempt,
-            debug_sink=debug_sink,
-        )
-    except TranslateCallError as e:
-        # Some errors will NOT be fixed by splitting (auth/model/config). Fail fast to avoid deep recursion.
-        msg_l = (str(e) or "").lower()
-        fatal_keys = ["401", "403", "unauthorized", "forbidden", "invalid api", "api key", "authentication",
-                      "model not found", "not found", "permission", "endpoint"]
-        if any(k in msg_l for k in fatal_keys):
-            raise
-
-        # Only split if we can
-        if len(items) <= 1 or max_depth <= 0:
-            raise
-        mid = len(items) // 2
-        left = translate_items_adaptive(client, model, items[:mid], src_lang, dst_lang, timeout_s,
-                                       on_attempt=on_attempt, debug_sink=debug_sink, max_depth=max_depth - 1)
-        right = translate_items_adaptive(client, model, items[mid:], src_lang, dst_lang, timeout_s,
-                                        on_attempt=on_attempt, debug_sink=debug_sink, max_depth=max_depth - 1)
-        left.update(right)
-        return left
 
 def translate_docx_in_place(
     doc: Document,
@@ -1276,7 +1141,7 @@ def translate_docx_in_place(
                 f"批次 {bi}/{total}：发送翻译请求（items={len(batch)}，approx_chars={approx_chars}）"
             )
 
-        translated_map = translate_items_adaptive(
+        translated_map = doubao_translate_items(
             client=client,
             model=model,
             items=batch,
@@ -1338,9 +1203,7 @@ ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
 
 def _init_state():
     defaults = {
-        "ocr_model_id": get_default_model(),
-        "translate_model_id": os.environ.get("ARK_TRANSLATE_MODEL") or DEFAULT_TRANSLATE_MODEL,
-        "mml2omml_xsl": os.environ.get(DEFAULT_MML2OMML_XSL_ENV, ""),
+        "model_id": get_default_model(),
         "max_side": 2200,
         "tile_h": 1600,
         "overlap": 160,
@@ -1366,9 +1229,9 @@ if "__pending_rec__" in st.session_state:
 
 with st.sidebar:
     st.subheader("Ark 配置")
-    st.text_input("OCR model（默认 EP 已填）", key="ocr_model_id")
-    st.text_input("Translate model（Model ID 或 EP）", key="translate_model_id")
-    st.text_input("MML2OMML.XSL 路径（可选：本机 Office 才需要；Streamlit Cloud 会自动走 Pandoc）", key="mml2omml_xsl")
+    st.text_input("model（默认 EP 已填，用于OCR/导出等）", key="model_id")
+    st.text_input("翻译专用 model/EP（可选，如 ep-2026... 或 doubao-seed-translation...）", key="translate_model_id")
+    st.caption("若填写翻译专用 model/EP，将优先用于 Tab② 的翻译。翻译模型建议走 /responses 调用。")
     st.caption(f"Base URL: {get_ark_base_url()}")
 
     st.divider()
@@ -1503,7 +1366,7 @@ with tabs[0]:
         return "\n\n".join(out).strip()
 
     if st.button("开始 OCR 并导出", type="primary", disabled=not images):
-        if not st.session_state["ocr_model_id"].strip():
+        if not st.session_state["model_id"].strip():
             st.error("请先填写 model（ep-xxxx 或模型ID）。")
             st.stop()
 
@@ -1521,7 +1384,7 @@ with tabs[0]:
 
             md = ocr_image_to_markdown(
                 client=client,
-                model=st.session_state["ocr_model_id"].strip(),
+                model=st.session_state["model_id"].strip(),
                 img=img,
                 max_side=int(st.session_state["max_side"]),
                 tile_h=int(st.session_state["tile_h"]),
@@ -1575,7 +1438,7 @@ with tabs[1]:
     colA, colB, colC = st.columns([1, 1, 1])
     with colA:
         do_equation_replace = st.checkbox("把 Word 原生公式（OMML）替换为 LaTeX 代码（best-effort）", value=False)
-        do_latex_to_omml = st.checkbox("检测 $...$ / $$...$$ 并转换为 Word 公式（OMML）", value=False)
+        do_latex_to_omml = st.checkbox("把文本中的 LaTeX 公式（$...$ / $$...$$ / \\(...\\) / \\[...\\]）转换为 Word 可编辑公式（Pandoc/OMML）", value=False)
         do_translate = st.checkbox("翻译文档（尽量保持原排版）", value=False)
 
     with colB:
@@ -1594,7 +1457,7 @@ with tabs[1]:
     show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
 
     if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
-        if not st.session_state["translate_model_id"].strip():
+        if not st.session_state["model_id"].strip():
             st.error("请先填写 model（ep-xxxx 或模型ID）。")
             st.stop()
 
@@ -1603,22 +1466,15 @@ with tabs[1]:
         doc_bytes = docx_file.read()
         doc = Document(io.BytesIO(doc_bytes))
 
-        # 0) 公式转为 Word 可编辑公式（OMML）（可选）
-        #    - Streamlit Cloud 没有 Office，因此默认走 Pandoc snippet 转换（不依赖 MML2OMML.XSL）
-        #    - 若你在本机运行且提供了 MML2OMML.XSL，则会优先用 XSLT 路线
+        # 0) 文本 LaTeX 公式 -> Word 可编辑公式（OMML）（Pandoc，无需 Office）
         if do_latex_to_omml:
             try:
-                counts = convert_math_to_omml_in_doc(
-                    doc,
-                    xsl_path=st.session_state.get("mml2omml_xsl", ""),
-                    log=lambda s: st.info(s),
-                )
-                st.success(
-                    f"公式→OMML 转换完成：inline_latex={counts.get('inline_latex',0)}，subsup_groups={counts.get('subsup_groups',0)}"
-                )
+                n_conv = convert_inline_latex_tokens_to_omml_in_doc(doc, log=lambda s: st.info(s))
+                st.success(f"LaTeX→OMML 转换完成：{n_conv} 处")
             except Exception as e:
-                st.error(f"公式→OMML 转换失败：{type(e).__name__}: {e}")
+                st.error(f"LaTeX→OMML 转换失败：{type(e).__name__}: {e}")
                 st.stop()
+
 
         if do_equation_replace:
             with st.spinner("提取公式序列（pandoc）..."):
@@ -1671,30 +1527,19 @@ with tabs[1]:
                 )
 
             with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
-                try:
-                    translate_docx_in_place(
-                        doc=doc,
-                        client=client,
-                        model=st.session_state["translate_model_id"].strip(),
-                        src_lang=src_lang,
-                        dst_lang=dst_lang,
-                        max_batch_chars=int(max_batch_chars),
-                        timeout_s=int(st.session_state["translate_timeout_s"]),
-                        progress_cb=_batch_cb,
-                        diagnostic_cb=_diag_cb,
-                        attempt_msg_cb=(lambda msg: attempt_box.info(msg)),
-                    )
-                except TranslateCallError as e:
-                    st.error("翻译失败（TranslateCallError）。通常是：模型/EP 不可用、鉴权失败、限流、或返回不是合法 JSON。")
-                    st.error(sanitize_errmsg(str(e)))
-                    if getattr(e, "raw", None):
-                        with st.expander("展开查看模型原始输出（raw，已截断）"):
-                            st.code((e.raw or "")[:8000])
-                    st.stop()
-                except Exception as e:
-                    st.error("翻译失败（Exception）")
-                    st.error(sanitize_errmsg(f"{type(e).__name__}: {e}"))
-                    st.stop()
+                translate_docx_in_place(
+                    doc=doc,
+                    client=client,
+                    model=(st.session_state.get('translate_model_id') or st.session_state['model_id']).strip(),
+                    src_lang=src_lang,
+                    dst_lang=dst_lang,
+                    max_batch_chars=int(max_batch_chars),
+                    timeout_s=int(st.session_state["translate_timeout_s"]),
+                    progress_cb=_batch_cb,
+                    diagnostic_cb=_diag_cb,
+                    attempt_msg_cb=(lambda msg: attempt_box.info(msg)),
+                )
+
             if show_translate_diagnostics and diag_payload_holder:
                 diag_box.success(
                     f"翻译抓取诊断：\n"
