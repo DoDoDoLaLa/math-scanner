@@ -20,8 +20,6 @@ from PIL import Image, ImageFilter, ImageOps
 
 from openai import OpenAI
 
-import httpx
-
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table
@@ -200,150 +198,251 @@ def safe_chat_completions(
             return ArkResult(text="", error_message=f"overall timeout after {total_timeout_s}s (last_err={last_err})")
 
         if on_attempt:
-            on_attempt(attempt, retries, "request")
+            try:
+                on_attempt(attempt, retries, "request")
+            except Exception:
+                pass
 
         try:
-            kw = {}
-            if response_format is not None:
-                kw["response_format"] = response_format
+            # 重要：某些环境里 http 超时/流控可能导致请求“看起来卡死”。
+            # 这里用线程包一层硬超时：即使底层库未按预期抛超时，我们也能继续重试并给出可见反馈。
+            def _do_req():
+                kwargs = dict(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout_s,
+                )
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                try:
+                    return client.chat.completions.create(**kwargs)
+                except TypeError:
+                    # 某些 OpenAI 兼容实现不支持 response_format；回退到普通请求
+                    kwargs.pop("response_format", None)
+                    return client.chat.completions.create(**kwargs)
 
-            rsp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **kw,
-            )
-            text = rsp.choices[0].message.content or ""
-            return ArkResult(text=text, error_message=None)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_do_req)
+                resp = fut.result(timeout=float(timeout_s) + 5.0)
+            txt = ""
+            if resp and resp.choices and resp.choices[0].message and resp.choices[0].message.content:
+                txt = resp.choices[0].message.content
+            return ArkResult(text=(txt or "").strip())
+
+        except concurrent.futures.TimeoutError:
+            msg = f"TimeoutError: request exceeded {timeout_s}s"
+            last_err = msg
+            wait_s = min(2 ** (attempt - 1), 20)
+            if on_attempt:
+                try:
+                    on_attempt(attempt, retries, f"request timeout, sleep {wait_s:.1f}s")
+                except Exception:
+                    pass
+            time.sleep(wait_s)
+            continue
 
         except Exception as e:
-            last_err = e
-            msg = str(e)
+            msg = f"{type(e).__name__}: {e}"
+            last_err = msg
 
-            # Try parse retry delay from error message, else exponential backoff.
-            delay = _parse_retry_delay_seconds(msg)
-            if delay is None:
-                delay = min(8.0, 0.8 * (2 ** (attempt - 1)))
-
-            if on_attempt:
-                on_attempt(attempt, retries, f"backoff {delay:.1f}s")
-
-            # Retry on typical transient failures
-            if any(x in msg.lower() for x in ["timeout", "timed out", "rate limit", "429", "overloaded", "try again", "internal"]):
-                time.sleep(delay)
+            # 429 / 限流：按服务端提示或指数退避，但仍受 total_timeout_s 约束
+            if ("429" in msg) or ("rate limit" in msg.lower()) or ("RESOURCE_EXHAUSTED" in msg):
+                wait_s = _parse_retry_delay_seconds(msg) or min(2 ** (attempt - 1), 60)
+                if on_attempt:
+                    try:
+                        on_attempt(attempt, retries, f"rate-limited, sleep {wait_s:.1f}s")
+                    except Exception:
+                        pass
+                time.sleep(min(wait_s + 0.3, 90.0))
                 continue
 
-            return ArkResult(text="", error_message=f"{type(e).__name__}: {e}")
+            # 其它错误：短暂退避
+            wait_s = min(2 ** (attempt - 1), 20)
+            if on_attempt:
+                try:
+                    on_attempt(attempt, retries, f"error, sleep {wait_s:.1f}s")
+                except Exception:
+                    pass
+            time.sleep(wait_s)
 
-    return ArkResult(text="", error_message=f"failed after retries: {last_err}")
+    return ArkResult(text="", error_message=f"retry exhausted: {last_err}")
 
 
 # ============================================================
-# 3) Image utils (tiling / enhance)
+# 3) OCR: image analysis + auto recommend
 # ============================================================
-def to_base64_jpeg(img: Image.Image, quality: int = 85) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+def analyze_image_density(img: Image.Image) -> Dict[str, float]:
+    g = ImageOps.grayscale(img)
+    g_small = g.copy()
+    g_small.thumbnail((900, 900))
+    w, h = g_small.size
 
-def enhance_for_ocr(img: Image.Image) -> Image.Image:
+    edges = g_small.filter(ImageFilter.FIND_EDGES)
+    eb = edges.point(lambda p: 255 if p > 40 else 0)
+    edge_px = sum(1 for p in eb.getdata() if p > 0)
+    edge_density = edge_px / float(w * h + 1e-9)
+
+    db = g_small.point(lambda p: 1 if p < 160 else 0)
+    dark_px = sum(db.getdata())
+    dark_ratio = dark_px / float(w * h + 1e-9)
+
+    return {"edge_density": edge_density, "dark_ratio": dark_ratio, "w": float(img.size[0]), "h": float(img.size[1])}
+
+def recommend_ocr_params(img: Image.Image, mode: str = "Balanced") -> Dict[str, int]:
+    m = analyze_image_density(img)
+    h = int(m["h"])
+    edge = m["edge_density"]
+    dark = m["dark_ratio"]
+    complexity = 0.6 * edge + 0.4 * dark
+
+    if mode == "Fast":
+        max_side, jpeg_q, out_tokens = 1600, 80, 3072
+        base_tile, base_overlap = 2000, 120
+    elif mode == "Accurate":
+        max_side, jpeg_q, out_tokens = 2800, 90, 6144
+        base_tile, base_overlap = 1400, 220
+    else:
+        max_side, jpeg_q, out_tokens = 2200, 85, 4096
+        base_tile, base_overlap = 1600, 160
+
+    if complexity > 0.18:
+        max_side = min(3200, max_side + 400)
+        out_tokens = min(8192, out_tokens + 1024)
+        tile_h = max(1000, base_tile - 300)
+        overlap = min(320, base_overlap + 80)
+        jpeg_q = min(95, jpeg_q + 5)
+    elif complexity < 0.10:
+        tile_h = min(2400, base_tile + 300)
+        overlap = max(80, base_overlap - 40)
+    else:
+        tile_h = base_tile
+        overlap = base_overlap
+
+    if h >= 4000 and complexity > 0.14:
+        tile_h = max(900, tile_h - 200)
+        out_tokens = min(8192, out_tokens + 512)
+
+    max_side = int(max(800, min(3200, max_side)))
+    tile_h = int(max(800, min(2600, tile_h)))
+    overlap = int(max(0, min(400, overlap)))
+    jpeg_q = int(max(50, min(95, jpeg_q)))
+    out_tokens = int(max(1024, min(8192, out_tokens)))
+
+    return {"max_side": max_side, "tile_h": tile_h, "overlap": overlap, "jpeg_q": jpeg_q, "out_tokens": out_tokens}
+
+
+# ============================================================
+# 4) OCR helpers
+# ============================================================
+def downscale(img: Image.Image, max_side: int) -> Image.Image:
     img = img.convert("RGB")
-    img = ImageOps.exif_transpose(img)
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
+    w, h = img.size
+    s = min(1.0, max_side / float(max(w, h)))
+    if s < 1.0:
+        img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
     return img
 
-def tile_image(img: Image.Image, tile_h: int, overlap: int) -> List[Image.Image]:
+def pil_to_jpeg_bytes(img: Image.Image, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+def slice_long(img: Image.Image, tile_h: int, overlap: int) -> List[Image.Image]:
     w, h = img.size
     if h <= tile_h:
         return [img]
-    tiles = []
+    overlap = max(0, min(overlap, tile_h // 2))
+    step = tile_h - overlap
+    out = []
     y = 0
     while y < h:
-        y2 = min(h, y + tile_h)
-        crop = img.crop((0, y, w, y2))
-        tiles.append(crop)
+        y2 = min(y + tile_h, h)
+        out.append(img.crop((0, y, w, y2)))
         if y2 >= h:
             break
-        y = y2 - overlap
-    return tiles
+        y = y + step
+    return out
 
-
-# ============================================================
-# 4) OCR
-# ============================================================
 def normalize_md(md: str) -> str:
-    md = (md or "").replace("\r\n", "\n").replace("\r", "\n")
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+    md = md.replace("\r\n", "\n").replace("\r", "\n")
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
 
-def dedupe_tail_head(prev: str, cur: str) -> str:
-    prev = prev.strip()
-    cur = cur.strip()
-    if not prev or not cur:
+def dedupe_tail_head(prev: str, cur: str, max_lines: int = 18) -> str:
+    pl = [x.strip() for x in prev.splitlines() if x.strip()]
+    cl = [x.strip() for x in cur.splitlines() if x.strip()]
+    if not pl or not cl:
         return cur
-    max_k = min(300, len(prev), len(cur))
-    best = 0
-    for k in range(10, max_k + 1):
-        if prev[-k:] == cur[:k]:
-            best = k
-    return cur[best:].lstrip("\n")
+    k = min(max_lines, len(pl), len(cl))
+    for n in range(k, 3, -1):
+        if pl[-n:] == cl[:n]:
+            raw = cur.splitlines()
+            removed = 0
+            keep = []
+            for line in raw:
+                if removed < n and line.strip():
+                    removed += 1
+                    continue
+                keep.append(line)
+            return "\n".join(keep).lstrip("\n")
+    return cur
 
-def ocr_images_to_markdown(
+def _jpeg_bytes_to_data_url(jpeg_bytes: bytes) -> str:
+    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
+
+def ocr_image_to_markdown(
     client: OpenAI,
-    images: List[Image.Image],
     model: str,
+    img: Image.Image,
     max_side: int,
     tile_h: int,
     overlap: int,
     jpeg_q: int,
     out_tokens: int,
     timeout_s: int,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> str:
+    img = downscale(img, max_side=max_side)
+    tiles = slice_long(img, tile_h=tile_h, overlap=overlap)
+
     chunks: List[str] = []
-    for idx, img in enumerate(images, start=1):
-        img = enhance_for_ocr(img)
-        # resize
-        w, h = img.size
-        scale = 1.0
-        m = max(w, h)
-        if m > max_side:
-            scale = max_side / float(m)
-        if scale != 1.0:
-            img = img.resize((int(w * scale), int(h * scale)))
+    total = len(tiles)
 
-        tiles = tile_image(img, tile_h=tile_h, overlap=overlap)
-        st.info(f"第 {idx}/{len(images)} 页：分块 {len(tiles)}")
+    for idx, timg in enumerate(tiles, start=1):
+        if progress_cb:
+            progress_cb(idx, total)
 
-        for ti, tile in enumerate(tiles, start=1):
-            b64 = to_base64_jpeg(tile, quality=jpeg_q)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": OCR_PROMPT_ZH},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ],
-                }
-            ]
-            res = safe_chat_completions(
-                client=client,
-                model=model,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=out_tokens,
-                timeout_s=timeout_s,
-                retries=6,
-            )
-            if res.error_message:
-                st.error(f"OCR 调用失败：\n\n{res.error_message}")
-                st.stop()
+        b = pil_to_jpeg_bytes(timg, quality=jpeg_q)
+        data_url = _jpeg_bytes_to_data_url(b)
 
-            md = normalize_md(res.text)
-            if chunks:
-                md = dedupe_tail_head(chunks[-1], md)
-            chunks.append(md)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": OCR_PROMPT_ZH},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }]
+
+        res = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=out_tokens,
+            timeout_s=timeout_s,
+            retries=6,
+        )
+        if res.error_message:
+            st.error(f"OCR 调用失败：\n\n{res.error_message}")
+            st.stop()
+
+        md = normalize_md(res.text)
+        if chunks:
+            md = dedupe_tail_head(chunks[-1], md)
+        chunks.append(md)
 
     return normalize_md("\n\n".join([c for c in chunks if c.strip()]))
 
@@ -493,7 +592,7 @@ def insert_text_run_at_paragraph_child(p_elm, idx: int, text: str):
     r.append(t)
     p_elm.insert(idx, r)
 
-def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]], use_equation_env: bool = False) -> int:
+def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]], use_equation_env: bool = True) -> int:
     all_ps = iter_all_paragraphs_extended(doc)
     seq_idx = 0
     replaced = 0
@@ -510,8 +609,7 @@ def replace_omml_with_latex_code(doc: Document, math_seq: List[Tuple[str, str]],
             if use_equation_env:
                 latex_text = (f"\\begin{{equation}} {body} \\end{{equation}}") if kind == "display" else (f"\\({body}\\)")
             else:
-                # ✅ Pandoc 可直接渲染（tex_math_dollars）：inline=$...$，display=$$...$$
-                latex_text = (f"$$\n{body}\n$$") if kind == "display" else (f"${body}$")
+                latex_text = (f"$$ {body} $$") if kind == "display" else (f"$ {body} $")
 
             parent = node.getparent()
             if parent is None:
@@ -720,16 +818,14 @@ def extract_json_object(text: str) -> dict:
 
     raise ValueError("no complete JSON object found (unbalanced braces)")
 
-
 def _ark_extract_output_text(resp_obj: dict) -> str:
     """Extract assistant text from an Ark/OpenAI-style Responses API payload.
 
-    Ark's /api/v3/responses is designed to be compatible with the OpenAI Responses schema:
-    resp_obj.output -> list[message] -> content -> list[{type: "output_text", text: "..."}]
-    (Some gateways may also return ChatCompletions-style `choices`.)
+    Ark /api/v3/responses follows the OpenAI Responses schema:
+      resp.output -> list[message] -> content -> list[{type: "output_text", text: "..."}]
+    Some gateways may also return ChatCompletions-style `choices`.
     """
     texts: List[str] = []
-
     if isinstance(resp_obj, dict):
         out = resp_obj.get("output")
         if isinstance(out, list):
@@ -740,12 +836,9 @@ def _ark_extract_output_text(resp_obj: dict) -> str:
                 if not isinstance(content, list):
                     continue
                 for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
                         texts.append(part["text"])
 
-        # Fallback: ChatCompletions-like shape
         if not texts:
             choices = resp_obj.get("choices")
             if isinstance(choices, list):
@@ -757,10 +850,8 @@ def _ark_extract_output_text(resp_obj: dict) -> str:
                     except Exception:
                         pass
 
-        # Fallback: sometimes gateways add a root `text`
         if not texts and isinstance(resp_obj.get("text"), str):
             texts.append(resp_obj["text"])
-
     return "".join(texts).strip()
 
 
@@ -777,16 +868,36 @@ def ark_translate_text_via_responses(
 ) -> str:
     """Call Ark Responses API translation model using translation_options.
 
-    According to Ark's translation model usage, each input_text can include:
-      translation_options: {source_language?, target_language}.
-
-    - If src_lang == "Auto", we omit source_language (model auto-detect).
-    - dst_lang must be a language code (e.g. en, zh, ja ...).
+    Docs: /api/v3/responses supports input_text.translation_options.source_language/target_language.
+    Response: output.content.type=output_text, output.content.text holds the text.
     """
     url = base_url.rstrip("/") + "/responses"
-    src_code: Optional[str] = None if src_lang == "Auto" else src_lang
 
-    trans_opts: Dict[str, str] = {"target_language": dst_lang}
+    # Ark translation expects language codes; we accept friendly labels from UI and map to codes.
+    lang_map = {
+        "Auto": None,
+        "Chinese": "zh",
+        "English": "en",
+        "Japanese": "ja",
+        "Korean": "ko",
+        "Spanish": "es",
+        "French": "fr",
+        "German": "de",
+        "Portuguese": "pt",
+        "Russian": "ru",
+        "Thai": "th",
+        "Vietnamese": "vi",
+        "Arabic": "ar",
+        "Czech": "cs",
+        "Danish": "da",
+    }
+
+    src_code = lang_map.get(src_lang, src_lang)
+    dst_code = lang_map.get(dst_lang, dst_lang) or dst_lang
+    if dst_code in (None, "", "Auto"):
+        raise TranslateCallError("target language must be specified (not Auto)")
+
+    trans_opts: Dict[str, str] = {"target_language": dst_code}
     if src_code:
         trans_opts["source_language"] = src_code
 
@@ -806,9 +917,7 @@ def ark_translate_text_via_responses(
         ],
     }
 
-    t0 = time.time()
     last_err: Optional[str] = None
-
     for attempt in range(1, retries + 1):
         if on_attempt:
             on_attempt(attempt, retries, "send")
@@ -825,40 +934,31 @@ def ark_translate_text_via_responses(
                 )
 
             if r.status_code >= 400:
-                # Try parse structured error
                 try:
                     err_obj = r.json()
                 except Exception:
                     err_obj = None
-
                 msg = None
                 if isinstance(err_obj, dict):
-                    # common shapes
-                    msg = (
-                        err_obj.get("error", {}) if isinstance(err_obj.get("error"), dict) else None
-                    )
-                    if isinstance(msg, dict):
-                        msg = msg.get("message") or msg.get("msg")
-                    if not msg:
-                        msg = err_obj.get("message") or err_obj.get("msg")
-
+                    err = err_obj.get("error")
+                    if isinstance(err, dict):
+                        msg = err.get("message") or err.get("msg")
+                    msg = msg or err_obj.get("message") or err_obj.get("msg")
                 msg = msg or f"HTTP {r.status_code}: {r.text[:400]}"
                 last_err = msg
 
-                # Retry on rate limit / transient errors
                 if r.status_code in (408, 409, 429) or (500 <= r.status_code < 600):
                     delay = _parse_retry_delay_seconds(msg) or min(8.0, 0.8 * (2 ** (attempt - 1)))
                     if on_attempt:
                         on_attempt(attempt, retries, f"backoff {delay:.1f}s")
                     time.sleep(delay)
                     continue
-
                 raise TranslateCallError(f"translate http error: {msg}")
 
             obj = r.json()
             out_text = _ark_extract_output_text(obj)
             if not out_text:
-                raise TranslateCallError("empty translate response text", raw=json.dumps(obj, ensure_ascii=False)[:800])
+                raise TranslateCallError("empty translate response text")
             return out_text
 
         except (httpx.TimeoutException, httpx.TransportError) as e:
@@ -867,11 +967,6 @@ def ark_translate_text_via_responses(
             if on_attempt:
                 on_attempt(attempt, retries, f"network backoff {delay:.1f}s")
             time.sleep(delay)
-            continue
-
-        # overall wall-clock safeguard (avoid endless retries)
-        if (time.time() - t0) > (timeout_s + 120):
-            break
 
     raise TranslateCallError(f"translate failed after retries: {last_err}")
 
@@ -886,15 +981,12 @@ def doubao_translate_items(
     on_attempt: Optional[Callable[[int, int, str], None]] = None,
     debug_sink: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, List[str]]:
-    """Translate a batch of items via the dedicated translation model (Responses API + translation_options).
+    """Translate a batch of items via the dedicated translation model (Responses API).
 
-    ⚠️ IMPORTANT CHANGE (per requirement):
-    - When "translate" is enabled, we ALWAYS use DEFAULT_TRANSLATE_MODEL (ep-20260203211039-n9v2f).
-    - We do NOT use any other model for translation.
-    - We do NOT rely on JSON-structured output from the model; we translate each segment directly.
-
-    Returns:
-        dict[item_id] = translated_segments (same length as input segments)
+    IMPORTANT (per requirement):
+    - When translation is enabled, we ALWAYS use DEFAULT_TRANSLATE_MODEL = ep-20260203211039-n9v2f.
+    - We do NOT use other models for translation and do NOT ask the model to output JSON.
+    - We translate each segment directly so $...$/__MATH_x__ placeholders are preserved by protect_math().
     """
     api_key = get_api_key()
     base_url = get_ark_base_url()
@@ -902,32 +994,26 @@ def doubao_translate_items(
 
     # Flatten tasks
     tasks: List[Tuple[str, int, str]] = []
+    out_buf: Dict[str, List[Optional[str]]] = {}
+
     for it in items:
         _id = it.get("id")
         segs = it.get("segments")
         if not isinstance(_id, str) or not isinstance(segs, list):
             continue
+        out_buf[_id] = [None] * len(segs)
         for j, seg in enumerate(segs):
-            if not isinstance(seg, str):
-                seg = ""
-            tasks.append((_id, j, seg))
+            tasks.append((_id, j, seg if isinstance(seg, str) else ""))
 
-    # Pre-allocate output buffers
-    out: Dict[str, List[Optional[str]]] = {}
-    for it in items:
-        _id = it.get("id")
-        segs = it.get("segments")
-        if isinstance(_id, str) and isinstance(segs, list):
-            out[_id] = [None] * len(segs)
-
-    # Translate in parallel (best-effort). Keep worker count conservative.
-    max_workers = min(8, max(2, (os.cpu_count() or 4)))
+    # Concurrency: keep conservative to avoid rate-limit bursts.
+    max_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
     errors: List[str] = []
 
     def _do_one(t: Tuple[str, int, str]) -> Tuple[str, int, str]:
         _id, j, seg = t
         if not seg.strip():
-            return _id, j, seg  # keep whitespace
+            return _id, j, seg
+
         translated = ark_translate_text_via_responses(
             api_key=api_key,
             base_url=base_url,
@@ -940,7 +1026,6 @@ def doubao_translate_items(
             on_attempt=on_attempt,
         )
         if debug_sink:
-            # only store a short snippet to avoid huge logs
             debug_sink(translated[:400])
         return _id, j, translated
 
@@ -949,23 +1034,42 @@ def doubao_translate_items(
         for fut in concurrent.futures.as_completed(futs):
             try:
                 _id, j, translated = fut.result()
-                if _id in out and 0 <= j < len(out[_id]):
-                    out[_id][j] = translated
+                if _id in out_buf and 0 <= j < len(out_buf[_id]):
+                    out_buf[_id][j] = translated
             except Exception as e:
                 errors.append(f"{type(e).__name__}: {e}")
 
-    if errors:
+    # Retry failed segments sequentially once (often fixes transient 429).
+    if any(v is None for segs in out_buf.values() for v in segs):
+        for _id, segs in list(out_buf.items()):
+            for j, val in enumerate(segs):
+                if val is not None:
+                    continue
+                seg = next((s for (iid, jj, s) in tasks if iid == _id and jj == j), "")
+                try:
+                    out_buf[_id][j] = ark_translate_text_via_responses(
+                        api_key=api_key,
+                        base_url=base_url,
+                        text=seg,
+                        src_lang=src_lang,
+                        dst_lang=dst_lang,
+                        timeout_s=timeout_s,
+                        model=translate_model,
+                        retries=6,
+                        on_attempt=on_attempt,
+                    )
+                except Exception as e:
+                    errors.append(f"{type(e).__name__}: {e}")
+
+    if errors and any(v is None for segs in out_buf.values() for v in segs):
         raise TranslateCallError("; ".join(errors[:3]) + (" ..." if len(errors) > 3 else ""))
 
-    # Finalize: convert Optional[str] -> str, and validate completeness
     final: Dict[str, List[str]] = {}
-    for _id, segs in out.items():
+    for _id, segs in out_buf.items():
         if any(s is None for s in segs):
             raise TranslateCallError(f"missing translated segments for {_id}")
         final[_id] = [s or "" for s in segs]
-
     return final
-
 
 def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min: int = 4000, clamp_max: int = 20000) -> int:
     """
@@ -992,29 +1096,22 @@ def translate_items_adaptive(
     timeout_s: int,
     on_attempt: Optional[Callable[[int, int, str], None]] = None,
     debug_sink: Optional[Callable[[str], None]] = None,
-     max_depth: int = 3,
-    target_batches: int = 6,
+    max_depth: int = 10,
 ) -> Dict[str, List[str]]:
-    """
-    自适应翻译调度器（保留接口不动，内部仍强制走 dedicated translation model）。
+    """Translate with automatic batch splitting on timeout/invalid JSON.
 
-    设计目标：
-    - 不动你其他功能；
-    - 翻译时全部使用 DEFAULT_TRANSLATE_MODEL（ep-20260203211039-n9v2f）；
-    - 如果某次翻译失败，按“items 批次”递归二分，直到 depth 用尽；
-    - 最终返回 dict[id] = segments[]（长度一致）。
-
-    注意：实际翻译粒度已在 doubao_translate_items() 内部做到了 segment-level 并发，
-    这里的分批更多是为了“失败时缩小范围 + 更稳”。
+    This is the main fix for “small text works, large text times out / hangs”.
+    Strategy:
+    - Try translating the batch as-is.
+    - If it fails (timeout, rate-limit, invalid JSON), split the batch into halves and retry.
+    - Merge results. Stops splitting when batch has 1 item or max_depth reached.
     """
     if not items:
         return {}
-
-    # 首先尝试一次性翻译（最省时）
     try:
         return doubao_translate_items(
             client=client,
-            model=model,  # ignored for translation (kept for compatibility)
+            model=model,
             items=items,
             src_lang=src_lang,
             dst_lang=dst_lang,
@@ -1022,394 +1119,555 @@ def translate_items_adaptive(
             on_attempt=on_attempt,
             debug_sink=debug_sink,
         )
-    except Exception as e:
-        if max_depth <= 0 or len(items) == 1:
+    except TranslateCallError as e:
+        # Only split if we can
+        if len(items) <= 1 or max_depth <= 0:
             raise
+        mid = len(items) // 2
+        left = translate_items_adaptive(client, model, items[:mid], src_lang, dst_lang, timeout_s,
+                                       on_attempt=on_attempt, debug_sink=debug_sink, max_depth=max_depth - 1)
+        right = translate_items_adaptive(client, model, items[mid:], src_lang, dst_lang, timeout_s,
+                                        on_attempt=on_attempt, debug_sink=debug_sink, max_depth=max_depth - 1)
+        left.update(right)
+        return left
 
-        # 失败则二分递归（更稳）
-        mid = max(1, len(items) // 2)
-        left = items[:mid]
-        right = items[mid:]
-
-        left_res = translate_items_adaptive(
-            client=client,
-            model=model,
-            items=left,
-            src_lang=src_lang,
-            dst_lang=dst_lang,
-            timeout_s=timeout_s,
-            on_attempt=on_attempt,
-            debug_sink=debug_sink,
-            max_depth=max_depth - 1,
-            target_batches=target_batches,
-        )
-        right_res = translate_items_adaptive(
-            client=client,
-            model=model,
-            items=right,
-            src_lang=src_lang,
-            dst_lang=dst_lang,
-            timeout_s=timeout_s,
-            on_attempt=on_attempt,
-            debug_sink=debug_sink,
-            max_depth=max_depth - 1,
-            target_batches=target_batches,
-        )
-        left_res.update(right_res)
-        return left_res
-
-
-# ============================================================
-# 7) DOCX translate pipeline (extract->translate->apply)
-# ============================================================
-def paragraph_get_text(p: Paragraph) -> str:
-    # python-docx 里 p.text 会合并 runs，但会丢失某些 field；这里仍用 p.text 作为 best-effort
-    return p.text or ""
-
-def paragraph_set_text_preserve_style(p: Paragraph, new_text: str):
-    """
-    best-effort：保留段落级样式，但 runs 样式不完全保留（除非做更复杂的 run-diff）。
-    这里不动你现有结构，采用“清空 runs -> 写一个 run”策略。
-    """
-    # 清空原 runs
-    for r in list(p.runs):
-        try:
-            r._r.getparent().remove(r._r)
-        except Exception:
-            pass
-    # 写入新 run
-    run = p.add_run(new_text)
-    # 尽量保留段落 style：p.style 不动即可
-
-def build_items_from_docx(doc: Document) -> Tuple[List[dict], Dict[str, List[Paragraph]]]:
-    """
-    将 docx 中所有段落（含表格、页眉页脚）抽取成 items:
-      items = [{"id": "...", "segments":[seg]}]
-    同时返回 id -> Paragraph list 映射，用于回写。
-    """
-    ps = iter_all_paragraphs_extended(doc)
-    id2ps: Dict[str, List[Paragraph]] = {}
-    items: List[dict] = []
-
-    for i, p in enumerate(ps):
-        txt = paragraph_get_text(p)
-        # 跳过空段落
-        if not txt or not txt.strip():
-            continue
-
-        pid = f"p_{i}"
-        id2ps[pid] = [p]
-        items.append({"id": pid, "segments": [txt]})
-
-    return items, id2ps
-
-def apply_translation_to_docx(
+def translate_docx_in_place(
     doc: Document,
-    translated: Dict[str, List[str]],
-    id2ps: Dict[str, List[Paragraph]],
-    protect_math_enabled: bool = True,
-):
-    """
-    回写翻译结果到 doc（best-effort）
-    - protect_math_enabled：对段落文本中的公式/环境先做 __MATH_k__ 保护，翻译后再恢复
-    """
-    for pid, ps in id2ps.items():
-        if pid not in translated:
-            continue
-        segs = translated[pid]
-        if not segs:
-            continue
-        new_text = segs[0] if isinstance(segs[0], str) else ""
-
-        for p in ps:
-            paragraph_set_text_preserve_style(p, new_text)
-
-def translate_docx_bytes(
-    docx_bytes: bytes,
+    client: OpenAI,
+    model: str,
     src_lang: str,
     dst_lang: str,
-    translate_timeout_s: int,
-    on_progress: Optional[Callable[[str], None]] = None,
-) -> bytes:
-    """
-    Word 内翻译（保留排版 best-effort）：
-    - 抽取段落文本
-    - 对每段进行公式占位保护（避免翻译破坏 $...$ / $$...$$ / \(...\) / equation env）
-    - 使用翻译模型（Responses API）翻译
-    - 恢复公式占位符
-    - 回写 docx
-    """
-    doc = Document(io.BytesIO(docx_bytes))
+    max_batch_chars: int,
+    timeout_s: int,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    diagnostic_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    attempt_msg_cb: Optional[Callable[[str], None]] = None,
+):
+    all_ps = iter_all_paragraphs_extended(doc)
 
-    items, id2ps = build_items_from_docx(doc)
+    items: List[dict] = []
+    para_refs: Dict[str, Tuple[List[Any], List[Dict[str, str]]]] = {}
+    pid = 0
 
-    # 1) protect math tokens per segment
-    protected_items: List[dict] = []
-    token_maps: Dict[str, Dict[str, str]] = {}
+    total_runs = 0
+    total_visible_chars = 0
 
-    for it in items:
-        pid = it["id"]
-        seg = it["segments"][0]
-        protected, mapping = protect_math(seg)
-        token_maps[pid] = mapping
-        protected_items.append({"id": pid, "segments": [protected]})
+    for p in all_ps:
+        runs = [r for r in p.runs if r.text is not None and r.text != ""]
+        if not runs:
+            continue
 
-    client = get_ark_client(default_timeout_s=translate_timeout_s)
+        segs = []
+        maps = []
+        for r in runs:
+            total_runs += 1
+            total_visible_chars += len(r.text or "")
+            protected, mp = protect_math(r.text)
+            segs.append(protected)
+            maps.append(mp)
 
-    def _attempt_cb(a: int, n: int, phase: str):
-        if on_progress:
-            on_progress(f"Translate attempt {a}/{n}: {phase}")
+        if not "".join(segs).strip():
+            continue
 
-    translated_protected = translate_items_adaptive(
-        client=client,
-        model=get_default_model(),  # ignored for translation, kept for compatibility
-        items=protected_items,
-        src_lang=src_lang,
-        dst_lang=dst_lang,
-        timeout_s=translate_timeout_s,
-        on_attempt=_attempt_cb,
-        debug_sink=None,
-        max_depth=3,
+        pid += 1
+        item_id = f"p{pid}"
+        items.append({"id": item_id, "segments": segs})
+        para_refs[item_id] = (runs, maps)
+
+    if diagnostic_cb is not None:
+        diagnostic_cb({
+            "paragraphs_scanned": len(all_ps),
+            "items_built": len(items),
+            "runs_counted": total_runs,
+            "visible_chars_counted": total_visible_chars,
+        })
+
+    if not items:
+        # 关键：明确提示为什么“没有翻译”
+        st.warning(
+            "没有抓到可翻译的正文文本（items=0）。\n\n"
+            "常见原因：\n"
+            "1) 内容在文本框/形状（python-docx 默认无法读取）；\n"
+            "2) 内容主要在批注/脚注/尾注；\n"
+            "3) 内容是嵌入对象或图片。\n\n"
+            "建议：\n"
+            "- 若是文本框：优先用 Tab③ Pandoc 导出，或将文本框内容复制到正文段落后再翻译；\n"
+            "- 或改走 PDF/图片 OCR 路线。"
+        )
+        return
+
+    batches = chunk_items_for_api(items, max_chars=max_batch_chars)
+    total = len(batches)
+
+    for bi, batch in enumerate(batches, start=1):
+        if progress_cb:
+            progress_cb(bi, total)
+
+        if attempt_msg_cb:
+            try:
+                approx_chars = sum(len(json.dumps(it, ensure_ascii=False)) for it in batch)
+            except Exception:
+                approx_chars = -1
+            attempt_msg_cb(
+                f"批次 {bi}/{total}：发送翻译请求（items={len(batch)}，approx_chars={approx_chars}）"
+            )
+
+        translated_map = translate_items_adaptive(
+            client=client,
+            model=model,
+            items=batch,
+            src_lang=src_lang,
+            dst_lang=dst_lang,
+            timeout_s=timeout_s,
+            on_attempt=(lambda a, n, ph: attempt_msg_cb(f"批次 {bi}/{total}：请求尝试 {a}/{n} · {ph}") if attempt_msg_cb else None),
+            debug_sink=(lambda raw: attempt_msg_cb(f"批次 {bi}/{total}：已收到原始输出（len={len(raw)})") if attempt_msg_cb else None),
+        )
+
+        if attempt_msg_cb:
+            attempt_msg_cb(f"批次 {bi}/{total}：收到响应，开始解析/写回…")
+
+        for it in batch:
+            item_id = it["id"]
+            if item_id not in translated_map:
+                continue
+
+            runs, maps = para_refs[item_id]
+            out_segs = translated_map[item_id]
+
+            if len(out_segs) != len(runs):
+                whole = " ".join(out_segs)
+                whole = restore_tokens(whole, {k: v for mp in maps for k, v in mp.items()})
+                runs[0].text = whole
+                for r in runs[1:]:
+                    r.text = ""
+                continue
+
+            for r, seg, mp in zip(runs, out_segs, maps):
+                r.text = restore_tokens(seg, mp)
+
+        if attempt_msg_cb:
+            attempt_msg_cb(f"批次 {bi}/{total}：写回完成")
+
+
+# ============================================================
+# 7) Export helpers
+# ============================================================
+def doc_to_bytes(doc: Document) -> bytes:
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+def pandoc_md_to_docx(md: str) -> bytes:
+    md = normalize_md(md) + "\n"
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "out.docx"
+        fmt = "markdown+fenced_code_blocks+tex_math_dollars"
+        pypandoc.convert_text(md, to="docx", format=fmt, outputfile=str(out))
+        return out.read_bytes()
+
+
+# ============================================================
+# 8) UI: sidebar
+# ============================================================
+ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
+
+def _init_state():
+    defaults = {
+        "ocr_model_id": get_default_model(),
+        "translate_model_id": os.environ.get("ARK_TRANSLATE_MODEL") or DEFAULT_TRANSLATE_MODEL,
+        "mml2omml_xsl": os.environ.get(DEFAULT_MML2OMML_XSL_ENV, ""),
+        "max_side": 2200,
+        "tile_h": 1600,
+        "overlap": 160,
+        "jpeg_q": 85,
+        "out_tokens": 4096,
+        "ocr_timeout_s": int(ocr_timeout_default),
+        "translate_timeout_s": int(translate_timeout_default),
+        "preset_mode": "Balanced",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+_init_state()
+
+# ✅ 关键修复：在任何 widget 创建之前应用 pending 推荐参数
+if "__pending_rec__" in st.session_state:
+    rec = st.session_state.pop("__pending_rec__")
+    for k in ["max_side", "tile_h", "overlap", "jpeg_q", "out_tokens"]:
+        if k in rec:
+            st.session_state[k] = int(rec[k])
+    st.session_state["__pending_rec_msg__"] = f"已回填推荐参数：{rec}"
+
+with st.sidebar:
+    st.subheader("Ark 配置")
+    st.text_input("OCR model（默认 EP 已填）", key="ocr_model_id")
+    st.text_input("Translate model（翻译专用 EP）", key="translate_model_id")
+    st.text_input("MML2OMML.XSL 路径（可选：仅用于把 $...$ 转 Word 公式）", key="mml2omml_xsl")
+    st.caption(f"Base URL: {get_ark_base_url()}")
+
+    st.divider()
+    st.subheader("OCR 参数与自动推荐")
+
+    st.selectbox("预设", ["Fast", "Balanced", "Accurate"], key="preset_mode",
+                 help="Fast：更快更省；Accurate：更清晰更稳但更慢；Balanced：折中。")
+
+    st.slider("Max side（最长边像素）", 800, 3200, key="max_side", step=100,
+              help="大：更清晰更准但更慢更贵；小：更快更省但小字/公式易错。")
+    st.slider("Tile height（切片高度）", 800, 2600, key="tile_h", step=100,
+              help="大：切片少更快但易截断；小：切片多更稳但更慢更贵。")
+    st.slider("Overlap（切片重叠）", 0, 400, key="overlap", step=10,
+              help="大：边界漏字更少但可能重复；小：更快但边界更易漏。")
+    st.slider("JPEG quality（压缩质量）", 50, 95, key="jpeg_q", step=1,
+              help="高：细节更清晰更准但更慢；低：更快但公式/小字更易糊。")
+    st.slider("OCR max tokens（输出上限）", 1024, 8192, key="out_tokens", step=256,
+              help="输出太短会截断漏字。截断优先：减 tile_h；其次：增 tokens。")
+
+    st.number_input("OCR 请求超时（秒）", min_value=30, max_value=600, key="ocr_timeout_s", step=10,
+                    help="大图/网络慢可调到 180-300。")
+    st.number_input("翻译请求超时（秒）", min_value=30, max_value=900, key="translate_timeout_s", step=10,
+                    help="10页以上建议 180-300；更稳可更高。")
+
+    with st.expander("参数速查（给不懂的人）", expanded=False):
+        st.markdown(
+            """
+- **输出经常断在半页**：先把 **Tile height** 调小（1600→1200），再把 **OCR max tokens** 调大（4096→6144）。
+- **速度太慢/切片太多**：把 **Tile height** 调大（1600→2000），再把 **Max side** 略降（2200→1800）。
+- **小字/公式错多**：把 **Max side** 调大（2200→2800+），或 **JPEG** 85→90/95。
+- **翻译大文档更稳**：把 **max_batch_chars** 调小（12000→8000/6000），同时把超时调高（180→300）。
+"""
+        )
+
+
+# ============================================================
+# 9) Tabs
+# ============================================================
+tabs = st.tabs([
+    "① PDF/图片 OCR → 导出",
+    "② Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
+    "③ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
+])
+
+# ---------------------------
+# Tab 1: OCR (PDF + images)
+# ---------------------------
+with tabs[0]:
+    st.subheader("PDF/图片 OCR（带自动参数推荐 + 进度条）")
+    st.write("建议：先上传 1 页代表性页面 → 点“自动推荐参数” → 再批量处理。")
+
+    if "__pending_rec_msg__" in st.session_state:
+        st.success(st.session_state.pop("__pending_rec_msg__"))
+
+    files = st.file_uploader(
+        "上传 PDF 或图片（可多选，PDF 将按页渲染）",
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True
     )
 
-    # 2) restore math tokens
-    translated_restored: Dict[str, List[str]] = {}
-    for pid, segs in translated_protected.items():
-        mapping = token_maps.get(pid, {})
-        restored = restore_tokens(segs[0], mapping) if segs else ""
-        translated_restored[pid] = [restored]
+    col_pdf = st.columns([1, 1, 2])
+    with col_pdf[0]:
+        pdf_dpi = st.selectbox("PDF 渲染 DPI", [200, 300, 400], index=1)
+    with col_pdf[1]:
+        pdf_max_pages = st.number_input("PDF 最多页数（0=不限制）", min_value=0, max_value=500, value=0, step=1)
+    with col_pdf[2]:
+        if not HAVE_PYMUPDF:
+            st.warning("未检测到 pymupdf，PDF 上传不可用。请 pip install pymupdf")
 
-    # 3) apply back
-    apply_translation_to_docx(doc, translated_restored, id2ps, protect_math_enabled=True)
+    # 先把所有输入转换成 images list
+    images: List[Image.Image] = []
+    page_meta: List[str] = []  # for page labeling
 
-    out_buf = io.BytesIO()
-    doc.save(out_buf)
-    return out_buf.getvalue()
-
-
-# ============================================================
-# 8) DOCX -> Markdown/LaTeX (Pandoc) + OMML -> $...$ / $$...$$ injection
-# ============================================================
-def docx_to_markdown_bytes(docx_bytes: bytes) -> str:
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        f = td / "in.docx"
-        f.write_bytes(docx_bytes)
-        md = pypandoc.convert_file(
-            str(f),
-            to="markdown",
-            format="docx",
-            extra_args=["--wrap=none"],
-        )
-    return normalize_md(md)
-
-def docx_to_latex_bytes(docx_bytes: bytes) -> str:
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        f = td / "in.docx"
-        f.write_bytes(docx_bytes)
-        tex = pypandoc.convert_file(
-            str(f),
-            to="latex",
-            format="docx",
-            extra_args=["--wrap=none"],
-        )
-    return tex.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-def export_docx_equations_to_pandoc_math_docx(docx_bytes: bytes, use_equation_env: bool = False) -> bytes:
-    """
-    核心：把 Word OMML 公式替换成 Pandoc 可渲染的数学标记（默认 $...$ / $$...$$）
-    - 先用 pandoc 把 docx 转 md 提取公式序列（math_seq）
-    - 再在原 docx XML 里按顺序把 oMath/oMathPara 替换成 latex 文本
-    """
-    math_seq = extract_math_from_docx_with_pandoc(docx_bytes)
-    doc = Document(io.BytesIO(docx_bytes))
-    n = replace_omml_with_latex_code(doc, math_seq, use_equation_env=use_equation_env)
-
-    out = io.BytesIO()
-    doc.save(out)
-    return out.getvalue()
-
-
-# ============================================================
-# 9) Streamlit UI
-# ============================================================
-with st.sidebar:
-    st.header("配置")
-    st.write("Ark Base URL:", get_ark_base_url())
-    st.write("默认（非翻译）模型:", get_default_model())
-    st.write("翻译固定模型:", DEFAULT_TRANSLATE_MODEL)
-
-    ocr_timeout_s, tr_timeout_s = get_timeout_defaults()
-    st.subheader("超时")
-    ocr_timeout_s = st.number_input("OCR 单次超时(秒)", min_value=30, max_value=600, value=int(ocr_timeout_s), step=10)
-    tr_timeout_s = st.number_input("翻译单次超时(秒)", min_value=30, max_value=600, value=int(tr_timeout_s), step=10)
-
-    st.subheader("OCR 参数")
-    max_side = st.number_input("最大边长缩放", min_value=800, max_value=4000, value=2200, step=100)
-    tile_h = st.number_input("分块高度(px)", min_value=800, max_value=4000, value=1800, step=100)
-    overlap = st.number_input("分块重叠(px)", min_value=0, max_value=800, value=120, step=20)
-    jpeg_q = st.number_input("JPEG质量", min_value=50, max_value=95, value=85, step=1)
-    ocr_out_tokens = st.number_input("OCR 输出 tokens", min_value=256, max_value=8192, value=3000, step=256)
-
-    st.subheader("公式转换")
-    use_equation_env = st.checkbox("Word公式导出为 \\begin{equation}...（否则 $$...$$）", value=False)
-
-    if HAVE_LATEX_OMML:
-        st.subheader("LaTeX->Word 公式（可选）")
-        xsl_path = st.text_input("MML2OMML.XSL 路径(可留空自动猜)", value=os.environ.get(DEFAULT_MML2OMML_XSL_ENV, ""))
-    else:
-        xsl_path = ""
-
-
-tab1, tab2, tab3, tab4 = st.tabs(["OCR（PDF/图片）→Markdown", "DOCX 内翻译", "DOCX 公式→Pandoc数学标记", "LaTeX($..$)→Word公式(可选)"])
-
-
-# ----------------------------
-# Tab 1: OCR
-# ----------------------------
-with tab1:
-    st.subheader("OCR（保持中文，不翻译）")
-    uploaded = st.file_uploader("上传 PDF 或图片", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
-
-    if st.button("开始 OCR", type="primary", disabled=not uploaded):
-        api_key = get_api_key()
-        client = get_ark_client(default_timeout_s=int(ocr_timeout_s))
-        model = get_default_model()  # ✅ OCR 仍用默认模型，不动
-
-        all_images: List[Image.Image] = []
-        for f in uploaded:
-            data = f.read()
-            if f.name.lower().endswith(".pdf"):
+    if files:
+        for f in files:
+            name = getattr(f, "name", "upload")
+            ext = (name.split(".")[-1] or "").lower()
+            if ext == "pdf":
                 if not HAVE_PYMUPDF:
-                    st.error("缺少 pymupdf，无法渲染 PDF。请安装：pip install pymupdf")
+                    st.error("你上传了 PDF，但环境缺少 pymupdf。请安装后重试：pip install pymupdf")
                     st.stop()
-                imgs = pdf_bytes_to_images(data, dpi=300, max_pages=None)
-                all_images.extend(imgs)
+                pdf_bytes = f.read()
+                try:
+                    imgs = pdf_bytes_to_images(
+                        pdf_bytes,
+                        dpi=int(pdf_dpi),
+                        max_pages=None if int(pdf_max_pages) == 0 else int(pdf_max_pages),
+                    )
+                except Exception as e:
+                    st.error(f"PDF 渲染失败：{e}")
+                    st.stop()
+                for i, im in enumerate(imgs, start=1):
+                    images.append(im)
+                    page_meta.append(f"{name} - p{i}")
             else:
-                img = Image.open(io.BytesIO(data)).convert("RGB")
-                all_images.append(img)
+                try:
+                    im = Image.open(f)
+                    images.append(im)
+                    page_meta.append(name)
+                except Exception as e:
+                    st.warning(f"无法读取图片 {name}：{e}")
 
-        md = ocr_images_to_markdown(
-            client=client,
-            images=all_images,
-            model=model,
-            max_side=int(max_side),
-            tile_h=int(tile_h),
-            overlap=int(overlap),
-            jpeg_q=int(jpeg_q),
-            out_tokens=int(ocr_out_tokens),
-            timeout_s=int(ocr_timeout_s),
-        )
+    cols = st.columns([1, 1, 2])
+    with cols[0]:
+        auto_btn = st.button("🪄 自动推荐参数（基于第1页）", disabled=not images)
+    with cols[1]:
+        preset_btn = st.button("🎛️ 应用预设（Fast/Balanced/Accurate）", disabled=not images)
+    with cols[2]:
+        st.caption("自动推荐会根据图片高度与文字/边缘密度估计调整 max_side/tile/overlap/tokens。")
+
+    if images and auto_btn:
+        rec = recommend_ocr_params(images[0], mode=st.session_state["preset_mode"])
+        st.session_state["__pending_rec__"] = rec
+        st.rerun()
+
+    if images and preset_btn:
+        rec = recommend_ocr_params(images[0], mode=st.session_state["preset_mode"])
+        st.session_state["__pending_rec__"] = rec
+        st.rerun()
+
+    join_lines = st.checkbox("可选：合并断行（适合 PDF 每行强制换行）", value=False)
+
+    def merge_hard_wraps(md: str) -> str:
+        parts = md.split("\n\n")
+        out = []
+        for p in parts:
+            lines = [x.strip() for x in p.splitlines()]
+            if any(l.startswith(("-", "*", "|", "#")) for l in lines):
+                out.append("\n".join(p.splitlines()))
+            else:
+                out.append(" ".join([l for l in lines if l != ""]).strip())
+        return "\n\n".join(out).strip()
+
+    if st.button("开始 OCR 并导出", type="primary", disabled=not images):
+        if not st.session_state["ocr_model_id"].strip():
+            st.error("请先填写 model（ep-xxxx 或模型ID）。")
+            st.stop()
+
+        client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
+
+        pages = []
+        total_pages = len(images)
+        page_bar = st.progress(0, text="准备 OCR…")
+
+        for pi, img in enumerate(images, start=1):
+            tile_bar = st.progress(0, text=f"OCR 第 {pi}/{total_pages} 页：准备切片…")
+
+            def _tile_cb(cur: int, total: int):
+                tile_bar.progress(int(cur / total * 100), text=f"OCR 第 {pi}/{total_pages} 页：切片 {cur}/{total}")
+
+            md = ocr_image_to_markdown(
+                client=client,
+                model=st.session_state["ocr_model_id"].strip(),
+                img=img,
+                max_side=int(st.session_state["max_side"]),
+                tile_h=int(st.session_state["tile_h"]),
+                overlap=int(st.session_state["overlap"]),
+                jpeg_q=int(st.session_state["jpeg_q"]),
+                out_tokens=int(st.session_state["out_tokens"]),
+                timeout_s=int(st.session_state["ocr_timeout_s"]),
+                progress_cb=_tile_cb,
+            )
+
+            if join_lines:
+                md = merge_hard_wraps(md)
+
+            label = page_meta[pi - 1] if pi - 1 < len(page_meta) else f"Page {pi}"
+            pages.append(f"## 第 {pi} 页（{label}）\n\n{md}")
+            page_bar.progress(int(pi / total_pages * 100), text=f"已完成 {pi}/{total_pages} 页")
+            tile_bar.empty()
+
+        merged_md = normalize_md("\n\n---\n\n".join(pages))
+
         st.success("OCR 完成")
-        st.text_area("OCR Markdown 输出", value=md, height=400)
+        st.markdown("### 预览（Markdown）")
+        st.code(merged_md, language="markdown")
 
-        st.download_button("下载 Markdown", data=md.encode("utf-8"), file_name="ocr.md", mime="text/markdown")
+        v1_docx = pandoc_md_to_docx(merged_md)
+        v2_md_bytes = merged_md.encode("utf-8")
+
+        v3_md = md_to_latex_code_style(merged_md)
+        v3_docx = pandoc_md_to_docx(v3_md)
+
+        st.download_button("下载 V1：Rendered.docx（pandoc渲染公式）", data=v1_docx, file_name="OCR_Rendered.docx")
+        st.download_button("下载 V2：Result.md（原始 Markdown）", data=v2_md_bytes, file_name="OCR_Result.md")
+        st.download_button("下载 V3：LaTeX_equation_code.docx（公式为 LaTeX 代码块）", data=v3_docx,
+                           file_name="OCR_LaTeX_equation_code.docx")
+        st.download_button("下载 V3：LaTeX_equation_code.md", data=v3_md.encode("utf-8"),
+                           file_name="OCR_LaTeX_equation_code.md")
 
 
-# ----------------------------
-# Tab 2: DOCX translate
-# ----------------------------
-with tab2:
-    st.subheader("DOCX 内翻译（翻译模型固定）")
-    docx_up = st.file_uploader("上传 DOCX", type=["docx"], key="docx_translate")
+# ---------------------------
+# Tab 2: DOCX translate + best-effort equation replace
+# ---------------------------
+with tabs[1]:
+    st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
+    st.warning(
+        "说明：Word 可编辑公式（OMML）要“可靠”转 LaTeX，推荐使用 Tab③ 的 Pandoc 直接导出。\n"
+        "本 Tab 的“就地替换公式”为 best-effort，可能出现错位/不全。"
+    )
 
-    colA, colB = st.columns(2)
+    docx_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_inplace")
+
+    colA, colB, colC = st.columns([1, 1, 1])
     with colA:
-        src_lang = st.selectbox("源语言（可 Auto）", ["Auto", "zh", "zh-Hant", "en", "ja", "ko", "de", "fr", "es", "it", "pt", "ru", "th", "vi", "ar", "cs", "da"], index=0)
+        do_equation_replace = st.checkbox("把 Word 原生公式（OMML）替换为 LaTeX 代码（best-effort）", value=False)
+        do_latex_to_omml = st.checkbox("检测 $...$ / $$...$$ 并转换为 Word 公式（OMML）", value=False)
+        do_translate = st.checkbox("翻译文档（尽量保持原排版）", value=False)
+
     with colB:
-        dst_lang = st.selectbox("目标语言", ["zh", "zh-Hant", "en", "ja", "ko", "de", "fr", "es", "it", "pt", "ru", "th", "vi", "ar", "cs", "da"], index=2)
+        src_lang = st.selectbox("源语言", ["Auto", "Chinese", "English", "Japanese", "Korean", "Spanish"], index=0)
+        dst_lang = st.selectbox("目标语言", ["Chinese", "English", "Japanese", "Korean", "Spanish"], index=1)
 
-    if st.button("开始翻译并导出 DOCX", type="primary", disabled=not docx_up):
-        raw = docx_up.read()
+    with colC:
+        auto_batch = st.checkbox("自动分批（推荐）", value=True)
+        target_batches = st.number_input("目标批次数（自动分批用）", min_value=1, max_value=50, value=8, step=1)
 
-        prog = st.empty()
-        def _log(s: str):
-            prog.info(s)
-
-        try:
-            out_bytes = translate_docx_bytes(
-                docx_bytes=raw,
-                src_lang=src_lang,
-                dst_lang=dst_lang,
-                translate_timeout_s=int(tr_timeout_s),
-                on_progress=_log,
-            )
-        except Exception as e:
-            st.error(f"翻译失败：{type(e).__name__}: {e}")
-            st.stop()
-
-        st.success("翻译完成")
-        st.download_button(
-            "下载 翻译后的 DOCX",
-            data=out_bytes,
-            file_name="translated.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-
-# ----------------------------
-# Tab 3: DOCX equation -> pandoc math delimiters
-# ----------------------------
-with tab3:
-    st.subheader("把 Word OMML 公式替换为 Pandoc 可渲染数学标记（$...$ / $$...$$）")
-    docx_eq = st.file_uploader("上传 DOCX（含可编辑公式）", type=["docx"], key="docx_eq")
-
-    if st.button("转换并导出 DOCX（公式变为 $ 标记）", type="primary", disabled=not docx_eq):
-        raw = docx_eq.read()
-        try:
-            out = export_docx_equations_to_pandoc_math_docx(raw, use_equation_env=bool(use_equation_env))
-        except Exception as e:
-            st.error(f"公式转换失败：{type(e).__name__}: {e}")
-            st.stop()
-
-        st.success("转换完成")
-        st.download_button(
-            "下载 DOCX（Pandoc 数学标记）",
-            data=out,
-            file_name="equations_as_pandoc_math.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-        # 也附带导出 markdown 方便你快速验证 pandoc 渲染是否正常
-        try:
-            md = docx_to_markdown_bytes(out)
-            st.text_area("可选：转换后 Markdown（pandoc 导出）", value=md, height=260)
-            st.download_button("下载 Markdown", data=md.encode("utf-8"), file_name="equations.md", mime="text/markdown")
-        except Exception:
-            pass
-
-
-# ----------------------------
-# Tab 4: LaTeX($..$) -> Word OMML (optional)
-# ----------------------------
-with tab4:
-    st.subheader("把文本中的 $...$ / $$...$$ 转成 Word 可编辑公式（可选功能）")
-    if not HAVE_LATEX_OMML:
-        st.warning("此功能需要安装：pip install lxml latex2mathml，并提供 MML2OMML.XSL（Office 自带）。")
+    if not auto_batch:
+        max_batch_chars = st.slider("翻译分批大小（max_batch_chars）", 4000, 20000, 12000, 500)
     else:
-        docx_l2w = st.file_uploader("上传 DOCX（里面包含 $...$ 公式文本）", type=["docx"], key="docx_l2w")
-        if st.button("转换并导出 DOCX（$ 公式 -> OMML）", type="primary", disabled=not docx_l2w):
-            raw = docx_l2w.read()
-            doc = Document(io.BytesIO(raw))
-            logbox = st.empty()
+        max_batch_chars = 12000  # will be computed after parsing doc
 
-            def _log(s: str):
-                logbox.info(s)
+    show_translate_diagnostics = st.checkbox("显示翻译抓取诊断（建议打开排错）", value=True)
 
-            try:
-                n = convert_inline_latex_to_omml_in_doc(doc, xsl_path=xsl_path, log=_log)
-            except Exception as e:
-                st.error(f"转换失败：{type(e).__name__}: {e}")
-                st.stop()
+    if st.button("开始处理并导出（new.docx）", type="primary", disabled=not docx_file):
+        if not st.session_state["translate_model_id"].strip():
+            st.error("请先填写 model（ep-xxxx 或模型ID）。")
+            st.stop()
 
-            out = io.BytesIO()
-            doc.save(out)
-            st.success(f"完成：转换 {n} 处公式")
-            st.download_button(
-                "下载 DOCX（含可编辑公式）",
-                data=out.getvalue(),
-                file_name="latex_to_omml.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
+
+        doc_bytes = docx_file.read()
+        doc = Document(io.BytesIO(doc_bytes))
+
+        # 0) 将文本中的 LaTeX 公式 ($...$ / $$...$$ / \(\) / \[\]) 转成 Word 原生公式（可选）
+
+if do_latex_to_omml:
+    if not HAVE_LATEX_OMML:
+        st.error("该功能需要额外依赖：lxml + latex2mathml（见 requirements 更新）。")
+        st.stop()
+
+    # 该功能仅在你提供 MML2OMML.XSL 时启用（Office 自带，Linux 容器通常没有）。
+    xsl_cfg = (st.session_state.get("mml2omml_xsl", "") or "").strip()
+    xsl_env = (os.environ.get(DEFAULT_MML2OMML_XSL_ENV, "") or "").strip()
+    xsl_path = xsl_cfg or xsl_env
+    if not xsl_path:
+        st.warning("未提供 MML2OMML.XSL 路径：已跳过 LaTeX→OMML（不影响翻译/公式导出）。")
+    else:
+        try:
+            converted = convert_inline_latex_to_omml_in_doc(
+                doc,
+                xsl_path=xsl_path,
+                log=lambda s: st.info(s),
             )
+            st.success(f"LaTeX→OMML 转换完成：{converted} 处")
+        except Exception as e:
+            st.warning(f"LaTeX→OMML 转换失败（已跳过，不影响后续）：{type(e).__name__}: {e}")
 
+        if do_equation_replace:
+            with st.spinner("提取公式序列（pandoc）..."):
+                math_seq = extract_math_from_docx_with_pandoc(doc_bytes)
+            with st.spinner("替换 Word 原生公式为 LaTeX 代码（best-effort）..."):
+                replaced_count = replace_omml_with_latex_code(doc, math_seq, use_equation_env=False)
+            st.info(f"已替换公式数量（best-effort）：{replaced_count}")
+
+        if do_translate:
+            batch_bar = st.progress(0, text="准备翻译…")
+
+            diag_box = st.empty()
+            attempt_box = st.empty()
+
+            def _batch_cb(cur: int, total: int):
+                batch_bar.progress(int(cur / total * 100), text=f"翻译批次 {cur}/{total}")
+
+            diag_payload_holder: Dict[str, Any] = {}
+
+            def _diag_cb(payload: Dict[str, Any]):
+                diag_payload_holder.update(payload)
+
+            # 先“预扫描”一次 items 以便自动分批（不重复实现：直接在函数里回调诊断）
+            # 技巧：先调用一次 translate_docx_in_place 之前计算批大小 ——我们需要 items 列表。
+            # 为避免重写大量逻辑，这里用同一套构建逻辑再构建一次 items（轻量）。
+            all_ps = iter_all_paragraphs_extended(doc)
+            items_preview: List[dict] = []
+            pid = 0
+            for p in all_ps:
+                runs = [r for r in p.runs if r.text is not None and r.text != ""]
+                if not runs:
+                    continue
+                segs = []
+                for r in runs:
+                    protected, _ = protect_math(r.text)
+                    segs.append(protected)
+                if not "".join(segs).strip():
+                    continue
+                pid += 1
+                items_preview.append({"id": f"p{pid}", "segments": segs})
+
+            if auto_batch:
+                max_batch_chars = estimate_auto_batch_chars(items_preview, target_batches=int(target_batches))
+                st.info(f"自动分批：items={len(items_preview)}，估算 max_batch_chars={max_batch_chars}")
+
+            if show_translate_diagnostics:
+                diag_box.info(
+                    "诊断将在开始后显示：扫描段落数 / 可翻译 items 数 / runs 数 / 字符数。\n"
+                    "若 items=0，多半是内容在文本框/形状里（python-docx 读不到）。"
+                )
+
+            with st.spinner("翻译中（分批提交，保持图片/公式位置不动）..."):
+                translate_docx_in_place(
+                    doc=doc,
+                    client=client,
+                    model=st.session_state["translate_model_id"].strip(),
+                    src_lang=src_lang,
+                    dst_lang=dst_lang,
+                    max_batch_chars=int(max_batch_chars),
+                    timeout_s=int(st.session_state["translate_timeout_s"]),
+                    progress_cb=_batch_cb,
+                    diagnostic_cb=_diag_cb,
+                    attempt_msg_cb=(lambda msg: attempt_box.info(msg)),
+                )
+
+            if show_translate_diagnostics and diag_payload_holder:
+                diag_box.success(
+                    f"翻译抓取诊断：\n"
+                    f"- paragraphs_scanned = {diag_payload_holder.get('paragraphs_scanned')}\n"
+                    f"- items_built       = {diag_payload_holder.get('items_built')}\n"
+                    f"- runs_counted      = {diag_payload_holder.get('runs_counted')}\n"
+                    f"- visible_chars     = {diag_payload_holder.get('visible_chars_counted')}\n"
+                )
+
+        out_docx_bytes = doc_to_bytes(doc)
+        st.success("处理完成")
+        st.download_button("下载 new.docx", data=out_docx_bytes, file_name="new.docx")
+
+
+# ---------------------------
+# Tab 3: DOCX -> LaTeX/Markdown export (recommended)
+# ---------------------------
+with tabs[2]:
+    st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐：可编辑公式最稳）")
+    st.write("这个模式不追求保留 Word 排版，而追求“学术 LaTeX 输出正确性”，尤其适合大量可编辑公式。")
+
+    docx_file2 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_export")
+
+    out_format = st.selectbox("导出格式", ["latex (.tex)", "markdown (.md)"], index=0)
+    wrap_none = st.checkbox("wrap=none（不自动换行）", value=True)
+
+    if st.button("导出", type="primary", disabled=not docx_file2):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            in_path = td / "in.docx"
+            in_path.write_bytes(docx_file2.read())
+
+            extra_args = []
+            if wrap_none:
+                extra_args += ["--wrap=none"]
+
+            if out_format.startswith("latex"):
+                out_text = pypandoc.convert_file(str(in_path), to="latex", format="docx", extra_args=extra_args)
+                st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="latex")
+                st.download_button("下载 .tex", data=out_text.encode("utf-8"), file_name="export.tex")
+            else:
+                out_text = pypandoc.convert_file(str(in_path), to="markdown", format="docx", extra_args=extra_args)
+                st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
+                st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
