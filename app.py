@@ -664,6 +664,106 @@ def estimate_auto_batch_chars(items: List[dict], target_batches: int, clamp_min:
     est = int(total / max(1, target_batches))
     return int(max(clamp_min, min(clamp_max, est)))
 
+
+# ---------------------------
+# Textbox / shape paragraphs (w:txbxContent)
+# ---------------------------
+_W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+def iter_textbox_paragraph_elements(doc: Document):
+    """
+    python-docx 默认不暴露文本框/形状里的段落。这里直接从 XML 抓取 w:txbxContent 内的 w:p。
+    注意：这能覆盖大量“PDF→DOCX”转换后的文档（文字常被塞进 textbox）。
+    """
+    try:
+        root = doc.part.element
+        # 仅抓取 textbox 内容
+        return root.xpath(".//w:txbxContent//w:p", namespaces=_W_NS)
+    except Exception:
+        return []
+
+def get_wt_text(p_elm) -> str:
+    ts = p_elm.xpath(".//w:t", namespaces=_W_NS)
+    return "".join([(t.text or "") for t in ts])
+
+def set_wt_text(p_elm, text: str):
+    """
+    将段落内所有 w:t 合并写回：写入第一个 w:t，其余清空。
+    这会牺牲部分 run 级格式，但能保证“翻译一定发生”。
+    """
+    ts = p_elm.xpath(".//w:t", namespaces=_W_NS)
+    if not ts:
+        # 没有 w:t 就插一个
+        r = OxmlElement("w:r")
+        t = OxmlElement("w:t")
+        t.text = text
+        r.append(t)
+        p_elm.append(r)
+        return
+    ts[0].text = text
+    for t in ts[1:]:
+        t.text = ""
+
+def build_translate_items_paragraph_level(doc: Document):
+    """
+    构建“段落级”翻译 items（更稳），覆盖：
+    - 正文/表格/页眉页脚：用 Paragraph 对象
+    - 文本框/形状：用 XML w:p 元素（w:txbxContent）
+    返回：items, writers
+      - items: [{"id":..., "segments":[...]}]
+      - writers[id] = callable(translated_text)->None
+    """
+    items = []
+    writers = {}
+    pid = 0
+
+    # 1) 普通段落（正文/表格/页眉页脚）
+    for p in iter_all_paragraphs_extended(doc):
+        full = "".join([r.text or "" for r in p.runs])
+        if not full or not full.strip():
+            continue
+        protected, mp = protect_math(full)
+        if not protected.strip():
+            continue
+        pid += 1
+        item_id = f"p{pid}"
+        items.append({"id": item_id, "segments": [protected]})
+
+        def _make_writer(paragraph: Paragraph, mapping: Dict[str, str]):
+            def _w(out_text: str):
+                out_text = restore_tokens(out_text, mapping)
+                if paragraph.runs:
+                    paragraph.runs[0].text = out_text
+                    for r in paragraph.runs[1:]:
+                        r.text = ""
+                else:
+                    paragraph.add_run(out_text)
+            return _w
+
+        writers[item_id] = _make_writer(p, mp)
+
+    # 2) 文本框段落（w:txbxContent）
+    for p_elm in iter_textbox_paragraph_elements(doc):
+        full = get_wt_text(p_elm)
+        if not full or not full.strip():
+            continue
+        protected, mp = protect_math(full)
+        if not protected.strip():
+            continue
+        pid += 1
+        item_id = f"tb{pid}"
+        items.append({"id": item_id, "segments": [protected]})
+
+        def _make_writer_xml(par_elm, mapping: Dict[str, str]):
+            def _w(out_text: str):
+                out_text = restore_tokens(out_text, mapping)
+                set_wt_text(par_elm, out_text)
+            return _w
+
+        writers[item_id] = _make_writer_xml(p_elm, mp)
+
+    return items, writers
+
 def translate_docx_in_place(
     doc: Document,
     client: OpenAI,
@@ -675,56 +775,36 @@ def translate_docx_in_place(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     diagnostic_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ):
-    all_ps = iter_all_paragraphs_extended(doc)
-
-    items: List[dict] = []
-    para_refs: Dict[str, Tuple[List[Any], List[Dict[str, str]]]] = {}
-    pid = 0
-
-    total_runs = 0
-    total_visible_chars = 0
-
-    for p in all_ps:
-        runs = [r for r in p.runs if r.text is not None and r.text != ""]
-        if not runs:
-            continue
-
-        segs = []
-        maps = []
-        for r in runs:
-            total_runs += 1
-            total_visible_chars += len(r.text or "")
-            protected, mp = protect_math(r.text)
-            segs.append(protected)
-            maps.append(mp)
-
-        if not "".join(segs).strip():
-            continue
-
-        pid += 1
-        item_id = f"p{pid}"
-        items.append({"id": item_id, "segments": segs})
-        para_refs[item_id] = (runs, maps)
+    """
+    ✅ 关键修复：改为“段落级翻译”+ 兼容文本框(w:txbxContent)。
+    这会牺牲部分 run 级格式（加粗/颜色/分段内细粒度样式），但能保证：
+    - 很多 PDF→DOCX 转换出来的“看似文本、实际在 textbox 里”的文档也能被翻译；
+    - run 被切得很碎导致 segments 对齐困难的问题大幅减少。
+    """
+    items, writers = build_translate_items_paragraph_level(doc)
 
     if diagnostic_cb is not None:
+        # 估算一些统计（用于排错）
+        total_chars = 0
+        for it in items:
+            if it.get("segments"):
+                total_chars += len(it["segments"][0])
         diagnostic_cb({
-            "paragraphs_scanned": len(all_ps),
             "items_built": len(items),
-            "runs_counted": total_runs,
-            "visible_chars_counted": total_visible_chars,
+            "estimated_chars": total_chars,
+            "contains_textbox_items": any(it["id"].startswith("tb") for it in items),
         })
 
     if not items:
-        # 关键：明确提示为什么“没有翻译”
-        st.warning(
-            "没有抓到可翻译的正文文本（items=0）。\n\n"
-            "常见原因：\n"
-            "1) 内容在文本框/形状（python-docx 默认无法读取）；\n"
-            "2) 内容主要在批注/脚注/尾注；\n"
-            "3) 内容是嵌入对象或图片。\n\n"
-            "建议：\n"
-            "- 若是文本框：优先用 Tab③ Pandoc 导出，或将文本框内容复制到正文段落后再翻译；\n"
-            "- 或改走 PDF/图片 OCR 路线。"
+        st.error(
+            "没有抓到任何可翻译文本（items=0）。\n\n"
+            "如果你肉眼看到文档里有文字但这里抓不到，最常见原因是：\n"
+            "1) 文本在图片里（扫描件）；\n"
+            "2) 文本在更特殊的对象里（SmartArt/嵌入对象/批注/脚注等）；\n"
+            "3) 文本被放在无法解析的 shape/textbox 结构中。\n\n"
+            "你可以：\n"
+            "- 走 Tab① 的 OCR（对扫描件最合适）；\n"
+            "- 或在 Word 里把文本框内容复制到正文后再翻译。"
         )
         return
 
@@ -736,29 +816,24 @@ def translate_docx_in_place(
             progress_cb(bi, total)
 
         translated_map = doubao_translate_items(
-            client=client, model=model, items=batch,
-            src_lang=src_lang, dst_lang=dst_lang,
+            client=client,
+            model=model,
+            items=batch,
+            src_lang=src_lang,
+            dst_lang=dst_lang,
             timeout_s=timeout_s,
         )
 
         for it in batch:
             item_id = it["id"]
-            if item_id not in translated_map:
+            segs = translated_map.get(item_id)
+            if not segs:
                 continue
-
-            runs, maps = para_refs[item_id]
-            out_segs = translated_map[item_id]
-
-            if len(out_segs) != len(runs):
-                whole = " ".join(out_segs)
-                whole = restore_tokens(whole, {k: v for mp in maps for k, v in mp.items()})
-                runs[0].text = whole
-                for r in runs[1:]:
-                    r.text = ""
-                continue
-
-            for r, seg, mp in zip(runs, out_segs, maps):
-                r.text = restore_tokens(seg, mp)
+            # 段落级：只取 segments[0]
+            out_text = segs[0] if isinstance(segs, list) and segs else ""
+            w = writers.get(item_id)
+            if w:
+                w(out_text)
 
 
 # ============================================================
@@ -1111,10 +1186,9 @@ with tabs[1]:
             if show_translate_diagnostics and diag_payload_holder:
                 diag_box.success(
                     f"翻译抓取诊断：\n"
-                    f"- paragraphs_scanned = {diag_payload_holder.get('paragraphs_scanned')}\n"
-                    f"- items_built       = {diag_payload_holder.get('items_built')}\n"
-                    f"- runs_counted      = {diag_payload_holder.get('runs_counted')}\n"
-                    f"- visible_chars     = {diag_payload_holder.get('visible_chars_counted')}\n"
+                    f"- items_built           = {diag_payload_holder.get('items_built')}\n"
+                    f"- estimated_chars       = {diag_payload_holder.get('estimated_chars')}\n"
+                    f"- contains_textbox_items= {diag_payload_holder.get('contains_textbox_items')}\n"
                 )
 
         out_docx_bytes = doc_to_bytes(doc)
