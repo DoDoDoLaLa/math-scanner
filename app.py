@@ -50,6 +50,16 @@ except Exception:
 # 0) App UI
 # ============================================================
 st.set_page_config(page_title="Ark OCR / DOCX Translate / LaTeX Export", layout="wide")
+
+st.markdown(
+    \"\"\"<style>
+    .stTabs [data-baseweb=\"tab\"] {font-size: 15px; padding: 10px 14px;}
+    .stTabs [aria-selected=\"true\"] {font-weight: 700;}
+    .hint-card {background: #f6f8fa; border: 1px solid #e5e7eb; padding: 12px 14px; border-radius: 10px;}
+    </style>\"\"\",
+    unsafe_allow_html=True,
+)
+
 st.title("学术 OCR & Word→LaTeX 工具（Ark EP 已接入）")
 
 st.caption(
@@ -64,6 +74,67 @@ def ensure_pandoc():
             pypandoc.download_pandoc()
         except Exception:
             pass
+
+# ============================================================
+# 0.5) Pipeline module (math conversions) + caching
+# ============================================================
+# 将 DOCX<->Pandoc<->DOCX(OMML) 的重活拆到 math_pipeline.py，app.py 主要负责 UI。
+import math_pipeline as mp
+
+# 统一读取上传文件字节：优先 getvalue()，避免 UploadedFile.read() 导致“二次读取为空”
+def read_uploaded_bytes(uploaded_file) -> bytes:
+    return mp.read_uploaded_bytes(uploaded_file)
+
+# --- 缓存：避免同一文件反复跑 Pandoc / AI（省时间、省费用） ---
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_docx_to_md_for_math(docx_sha: str, docx_bytes: bytes) -> str:
+    return mp.docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_roundtrip_omml(docx_sha: str, docx_bytes: bytes) -> bytes:
+    out, _md = mp.docx_roundtrip_make_equations_editable(docx_bytes)
+    return out
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_roundtrip_omml_with_md(docx_sha: str, docx_bytes: bytes):
+    return mp.docx_roundtrip_make_equations_editable(docx_bytes)
+
+# AI 结果也缓存（同文件 + 同参数 + 同模型）——避免重复付费
+@st.cache_data(show_spinner=False, max_entries=16)
+def _cached_ai_roundtrip(
+    docx_sha: str,
+    docx_bytes: bytes,
+    model: str,
+    max_batch_chars: int,
+    timeout_s: int,
+    out_tokens: int,
+    base_url: str,
+):
+    client = get_ark_client(int(timeout_s))
+
+    def call_llm(prompt: str) -> str:
+        res = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=int(out_tokens),
+            timeout_s=int(timeout_s),
+            retries=6,
+        )
+        if res.error_message:
+            raise RuntimeError(res.error_message)
+        return res.text or ""
+
+    # 缓存函数里不要用 st.progress 之类的 UI 组件（会破坏缓存）
+    return mp.docx_ai_roundtrip_make_equations_editable(
+        docx_bytes,
+        call_llm=call_llm,
+        max_batch_chars=int(max_batch_chars),
+        progress_cb=None,
+    )
+
+
 
 ensure_pandoc()
 
@@ -1268,240 +1339,8 @@ def pandoc_md_to_docx(md: str) -> bytes:
         pypandoc.convert_text(md, to="docx", format=fmt, outputfile=str(out))
         return out.read_bytes()
 
-def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
-    """DOCX -> Pandoc Markdown -> DOCX to convert $...$/$$...$$ text math into native Word equations (OMML).
-
-    Implementation:
-    1) docx -> markdown+tex_math_dollars  (keep TeX delimiters)
-    2) normalize/sanitize markdown (undo escaping that breaks TeX)
-    3) markdown+tex_math_dollars -> docx  (Pandoc emits OMML)
-    We use the original DOCX as --reference-doc to preserve styles as much as possible.
-    """
-    if not docx_bytes:
-        return docx_bytes
-
-    # Step 1-2: get sanitized markdown suitable for Pandoc's TeX math parser
-    md = docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
-    md = normalize_md(md) + "\n"
-
-    # Step 3: write back to DOCX (OMML)
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        in_path = td / "in.docx"
-        out_path = td / "out.docx"
-        in_path.write_bytes(docx_bytes)
-        pypandoc.convert_text(
-            md,
-            to="docx",
-            format="markdown+tex_math_dollars",
-            outputfile=str(out_path),
-            extra_args=["--reference-doc", str(in_path)],
-        )
-        return out_path.read_bytes()
 
 # ============================================================
-# 7.7) AI-assisted "DOCX text -> OCR-style math -> OMML" (Tab 3 enhancement)
-# ============================================================
-AI_MATH_CLEAN_PROMPT_ZH = """你是论文排版助理。请把我给你的 Markdown 文本“尽量保持原文不变”，只对其中的数学公式做纠错与统一格式，使其更像“图片 OCR 输出的学术 LaTeX”风格，便于后续用 Pandoc 解析成 Word 可编辑公式（OMML）。
-
-严格要求：
-1) 仅处理数学公式：位于 $...$ 或 $$...$$ 或 \\( ... \\) 或 \\[ ... \\] 或 \\begin{equation}...\\end{equation} 内的内容。普通文本不要改写措辞。
-2) 统一分隔符：
-   - 行内公式统一成 $...$
-   - 行间公式统一成 $$...$$（注意：$$...$$ 内部不要出现空行；如果有换行，保持为单个换行即可）
-3) 纠错策略（尽量保守，宁可不改也不要瞎改）：
-   - 把明显的“文本型下标/上标”统一为直立体：例如 P_seed -> P_{\\mathrm{seed}}；t_k^+ 中的 + 保留；类似 \\Delta_h、\\rho_h 这类命令保持不变。
-   - 保留 \\alpha \\beta 等 LaTeX 命令；不要把 \\\\alpha 之类的转义搞坏。
-   - 不要引入新的宏包命令；不要新增 \\label/\\ref 等。
-4) 不要输出解释，不要输出代码块围栏，不要输出 JSON。只输出修正后的 Markdown 纯文本。
-"""
-
-def _sanitize_tex_math_for_pandoc(md: str) -> str:
-    """Best-effort sanitizer so Pandoc can reliably parse TeX math.
-
-    - Do not rewrite normal text.
-    - Ensure $$...$$ blocks have no blank lines (Pandoc can mis-parse).
-    - Normalize some common escaping patterns from DOCX->Markdown conversions.
-    """
-    if not md:
-        return md
-
-    t = md.replace("\r\n", "\n").replace("\r", "\n")
-    t = t.replace("\u00A0", " ")  # NBSP
-
-    # Common over-escaping for dollar signs
-    t = t.replace(r"\\$", "$")
-    t = t.replace(r"\$", "$")
-
-    block_re = re.compile(r"(?s)\$\$(.+?)\$\$")
-    inline_re = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
-
-    def _clean_body(body: str, is_block: bool) -> str:
-        b = (body or "").strip()
-        if is_block:
-            b = re.sub(r"\n\s*\n+", "\n", b)  # collapse blank lines
-            b = re.sub(r"[ \t]+\n", "\n", b)    # trim line-end spaces
-        else:
-            b = b.replace("\n", " ")
-            b = re.sub(r"\s{2,}", " ", b)
-        return b.strip()
-
-    def _fix_block(m):
-        b = _clean_body(m.group(1), True)
-        return "$$\n" + b + "\n$$"
-
-    def _fix_inline(m):
-        b = _clean_body(m.group(1), False)
-        return "$" + b + "$"
-
-    t = block_re.sub(_fix_block, t)
-    t = inline_re.sub(_fix_inline, t)
-    return t
-
-
-def docx_to_pandoc_markdown_for_math(docx_bytes: bytes, wrap_none: bool = True) -> str:
-    """DOCX -> Markdown(+tex_math_dollars) suitable for later math parsing."""
-    if not docx_bytes:
-        return ""
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        in_path = td / "in.docx"
-        in_path.write_bytes(docx_bytes)
-        extra_args = ["--wrap=none"] if wrap_none else []
-        md = pypandoc.convert_file(
-            str(in_path),
-            to="markdown+tex_math_dollars",
-            format="docx",
-            extra_args=extra_args,
-        )
-    md = (md or "").replace("\r\n", "\n").replace("\r", "\n")
-
-    # Undo common escaping patterns that break TeX math parsing
-    md = md.replace(r"\$", "$")
-    md = md.replace(r"\\$", "$")
-    md = md.replace("\\\\", "\\")  # DOCX writer often escapes backslashes
-    md = normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
-    md = _sanitize_tex_math_for_pandoc(md)
-    return normalize_md(md)
-
-def chunk_text_for_ai(text: str, max_chars: int = 8000) -> List[str]:
-    """Chunk long markdown by paragraph boundaries."""
-    if not text:
-        return []
-    paras = text.split("\n\n")
-    chunks = []
-    cur = []
-    cur_len = 0
-    for p in paras:
-        p2 = p.strip("\n")
-        if not p2:
-            continue
-        add = p2 + "\n\n"
-        if cur and cur_len + len(add) > max_chars:
-            chunks.append("".join(cur).strip() + "\n")
-            cur = []
-            cur_len = 0
-        cur.append(add)
-        cur_len += len(add)
-    if cur:
-        chunks.append("".join(cur).strip() + "\n")
-    return chunks
-
-def ai_clean_markdown_math_like_ocr(
-    client: OpenAI,
-    model: str,
-    md: str,
-    *,
-    max_batch_chars: int,
-    timeout_s: int,
-    out_tokens: int,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-) -> str:
-    """Use LLM to normalize math to OCR-like $...$/$$...$$ style (best-effort)."""
-    if not md.strip():
-        return md
-    parts = chunk_text_for_ai(md, max_chars=max_batch_chars)
-    out_parts: List[str] = []
-    total = len(parts)
-    for i, part in enumerate(parts, start=1):
-        if progress_cb:
-            progress_cb(i, total)
-
-        messages = [{
-            "role": "user",
-            "content": AI_MATH_CLEAN_PROMPT_ZH.strip() + "\n\n---\n\n" + part
-        }]
-
-        res = safe_chat_completions(
-            client=client,
-            model=model,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=out_tokens,
-            timeout_s=timeout_s,
-            retries=6,
-        )
-        if res.error_message:
-            raise RuntimeError(res.error_message)
-
-        cleaned = normalize_md(res.text)
-        if out_parts:
-            cleaned = dedupe_tail_head(out_parts[-1], cleaned)
-        out_parts.append(cleaned)
-
-    merged = normalize_md("\n\n".join([p for p in out_parts if p.strip()]))
-    # Final safety: ensure pandoc-friendly
-    merged = normalize_pandoc_math(merged, display_style="dollars", inline_style="dollars")
-    merged = _sanitize_tex_math_for_pandoc(merged)
-    return normalize_md(merged)
-
-def docx_ai_roundtrip_make_equations_editable(
-    docx_bytes: bytes,
-    *,
-    client: OpenAI,
-    model: str,
-    max_batch_chars: int,
-    timeout_s: int,
-    out_tokens: int,
-) -> Tuple[bytes, str]:
-    """DOCX -> pandoc md -> AI math clean -> docx(OMML). Returns (docx_bytes, cleaned_markdown)."""
-    if not docx_bytes:
-        return docx_bytes, ""
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        in_path = td / "in.docx"
-        in_path.write_bytes(docx_bytes)
-
-        md = docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
-
-        # AI refinement with Streamlit progress
-        prog_bar = st.progress(0.0)
-        status = st.empty()
-        def _cb(i, total):
-            prog_bar.progress(min(1.0, i / max(total, 1)))
-            status.info(f"AI 校正中：{i}/{total}")
-        md2 = ai_clean_markdown_math_like_ocr(
-            client=client,
-            model=model,
-            md=md,
-            max_batch_chars=int(max_batch_chars),
-            timeout_s=int(timeout_s),
-            out_tokens=int(out_tokens),
-            progress_cb=_cb,
-        )
-        status.empty()
-        prog_bar.empty()
-
-        out_path = td / "out.docx"
-        pypandoc.convert_text(
-            md2,
-            to="docx",
-            format="markdown+tex_math_dollars",
-            outputfile=str(out_path),
-            extra_args=["--reference-doc", str(in_path)],
-        )
-        return out_path.read_bytes(), md2
-
 # ============================================================
 # 7.5) Pandoc math normalization helpers (for thesis-friendly editing)
 # ============================================================
@@ -1518,16 +1357,8 @@ def normalize_pandoc_math(
 ) -> str:
     """Normalize math delimiters produced by pandoc for easier paper editing.
 
-    - Pandoc LaTeX writer commonly emits inline math as \(...\) and display math as \[...\].
+    - Pandoc LaTeX writer commonly emits inline math as \(..\) and display math as \[..\].
     - Some sources may already contain $$...$$. We normalize both.
-    - display_style:
-        - equation  : \begin{equation} ... \end{equation} (numbered)
-        - equation* : \begin{equation*} ... \end{equation*} (unnumbered)
-        - bracket   : \[ ... \]
-        - dollars   : $$ ... $$
-    - inline_style:
-        - paren     : \( ... \)
-        - dollars   : $ ... $
     """
     if not text:
         return text
@@ -1547,7 +1378,6 @@ def normalize_pandoc_math(
             return _to_equation(body, starred=True)
         if display_style == "dollars":
             return f"$$\n{body}\n$$"
-        # bracket
         return f"\\[\n{body}\n\\]"
 
     # Normalize display math first (both \[\] and $$ $$)
@@ -1563,11 +1393,170 @@ def normalize_pandoc_math(
     # Normalize inline math (both \(\) and $ $)
     t = PANDOC_INLINE_MATH_PAREN_RE.sub(_inline_repl, t)
     t = PANDOC_INLINE_MATH_DOLLAR_RE.sub(lambda m: _inline_repl(m), t)
-
     return t
 
 
+# ---- Optional: improve Word OMML visual fidelity for "text-like" subscripts/superscripts ----
+# Example: P_seed  -> P_{\mathrm{seed}}
+MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
+MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
+SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
+
+def _fix_subsup_text_style_in_math(expr: str) -> str:
+    def repl(m):
+        op = m.group(1)  # _ or ^
+        word = m.group(2)
+        return f"{op}{{\\mathrm{{{word}}}}}"
+    return SUBSUP_TEXT_RE.sub(repl, expr)
+
+def normalize_math_text_style(md: str) -> str:
+    """Heuristic: inside $...$/$$...$$ convert bare multi-letter subscripts/superscripts to \mathrm{...}."""
+    if not md:
+        return md
+
+    def fix_block(m):
+        body2 = _fix_subsup_text_style_in_math(m.group(1))
+        return "$$\n" + body2.strip() + "\n$$"
+
+    def fix_inline(m):
+        body2 = _fix_subsup_text_style_in_math(m.group(1))
+        return "$" + body2.strip() + "$"
+
+    md2 = MATH_DOLLAR_BLOCK_RE.sub(fix_block, md)
+    md2 = MATH_DOLLAR_INLINE_RE.sub(fix_inline, md2)
+    return md2
+
+
+
+
+def _sanitize_tex_math_for_pandoc(md: str) -> str:
+    """Make TeX math in Markdown more pandoc-friendly before markdown->docx.
+
+    Why this exists:
+    - Pandoc's TeX math with $$...$$ does *not* allow blank lines inside the block,
+      otherwise it may terminate display math early and the remainder becomes normal text. 
+    - When coming from DOCX, pandoc's markdown writer can escape backslashes as
+      \\alpha (meaning \alpha). Inside math, we want to unescape command starters
+      (\\alpha -> \alpha) but keep real LaTeX linebreaks (\\) intact.
+
+    We only touch content *inside* $...$ / $$...$$.
+    """
+    if not md:
+        return md
+
+    def _fix_math_body(body: str) -> str:
+        # 1) remove blank lines inside display math
+        body = re.sub(r"\n[ \t]*\n+", "\n", body)
+
+        # 2) unescape backslashes only when it's likely a command starter:
+        #    \\alpha, \\rho, \\_, \\{  -> \alpha, \rho, \_, \{
+        #    but keep \\ (linebreak) when followed by whitespace/newline.
+        body = re.sub(r"\\\\(?=[A-Za-z_{])", r"\\", body)
+        return body
+
+    def _disp(m):
+        body = _fix_math_body(m.group(1)).strip(" \n\t")
+        return "$$\n" + body + "\n$$"
+
+    def _inline(m):
+        body = _fix_math_body(m.group(1)).replace("\n", " ").strip()
+        return "$" + body + "$"
+
+
+    md2 = MATH_DOLLAR_BLOCK_RE.sub(_disp, md)
+    md2 = MATH_DOLLAR_INLINE_RE.sub(_inline, md2)
+    return md2
 # ============================================================
+# 7.6) DOCX round-trip: $...$ / $$...$$ text math -> editable Word equations (OMML)
+#      (Pandoc parses TeX math and writes OMML)
+# ============================================================
+
+# $$ ... $$ and $ ... $ (inline) in markdown
+MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
+MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
+
+# Heuristic: sub/sup is plain text token (letters length>=2) -> wrap with \mathrm{...}
+# Example: P_c(t_k^+) -> c and k are single-letter (keep), but "seed" or "sc" should become \mathrm{seed}
+SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
+
+def _fix_subsup_text_style_in_math(expr: str) -> str:
+    def repl(m):
+        op = m.group(1)
+        word = m.group(2)
+        return f"{op}{{\\mathrm{{{word}}}}}"
+    return SUBSUP_TEXT_RE.sub(repl, expr)
+
+def normalize_math_text_style(md: str) -> str:
+    """Fix a common Pandoc/Word math nuance:
+    In TeX, multi-letter tokens in sub/sup are treated as variables (italic) unless wrapped.
+    For academic docs, users often intend them as text (e.g., P_seed, rho_h, t_k).
+    We heuristically wrap multi-letter sub/sup tokens with \mathrm{...}.
+    """
+    if not md:
+        return md
+
+    def fix_block(m):
+        body = m.group(1)
+        body2 = _fix_subsup_text_style_in_math(body)
+        return "$$\n" + body2.strip() + "\n$$"
+
+    def fix_inline(m):
+        body = m.group(1)
+        body2 = _fix_subsup_text_style_in_math(body)
+        return "$" + body2.strip() + "$"
+
+    t = md
+    t = MATH_DOLLAR_BLOCK_RE.sub(fix_block, t)
+    t = MATH_DOLLAR_INLINE_RE.sub(fix_inline, t)
+    return t
+
+def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
+    """Round-trip a DOCX through Pandoc Markdown to convert $...$/$$...$$ into native Word equations (OMML).
+
+    Pipeline:
+      1) docx -> markdown+tex_math_dollars (keeps math in plain text)
+      2) normalize escapes + math delimiters
+      3) markdown+tex_math_dollars -> docx (Pandoc emits OMML for TeX math)
+      4) use --reference-doc to preserve the original styles as much as possible
+    """
+    if not docx_bytes:
+        return docx_bytes
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        in_path = td / "in.docx"
+        in_path.write_bytes(docx_bytes)
+
+        # 1) docx -> markdown (keep $...$/$$...$$ as TeX math)
+        md = pypandoc.convert_file(
+            str(in_path),
+            to="markdown+tex_math_dollars",
+            format="docx",
+            extra_args=["--wrap=none"],
+        )
+        md = md.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 2) Undo pandoc escaping so TeX math stays parseable for the next step.
+        #    (In academic docs, literal dollar signs are rare; this is a pragmatic choice.)
+        md = md.replace(r"\$", "$")
+        md = md.replace("\\\\", "\\")  # \\ -> \
+
+        # 3) Normalize delimiters and text-style in subscripts/superscripts
+        md = normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
+        md = normalize_math_text_style(md)
+
+        # 4) markdown -> docx; use original docx as reference to keep styles
+        out_path = td / "out.docx"
+        pypandoc.convert_text(
+            md,
+            to="docx",
+            format="markdown+tex_math_dollars",
+            outputfile=str(out_path),
+            extra_args=["--reference-doc", str(in_path)],
+        )
+        return out_path.read_bytes()
+
+
 # 8) UI: sidebar
 # ============================================================
 ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
@@ -1686,7 +1675,7 @@ with tabs[0]:
                 if not HAVE_PYMUPDF:
                     st.error("你上传了 PDF，但环境缺少 pymupdf。请安装后重试：pip install pymupdf")
                     st.stop()
-                pdf_bytes = f.read()
+                pdf_bytes = read_uploaded_bytes(f)
                 try:
                     imgs = pdf_bytes_to_images(
                         pdf_bytes,
@@ -1838,7 +1827,7 @@ with tabs[1]:
         # 但这里仍保留输入框，便于你看到当前配置。
         client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
 
-        doc_bytes = docx_file.read()
+        doc_bytes = read_uploaded_bytes(docx_file)
         doc = Document(io.BytesIO(doc_bytes))
 
         # 0) 将文本中的 LaTeX 公式 ($...$ / $$...$$ / \(\) / \[\]) 转成 Word 原生公式（可选）
@@ -1982,8 +1971,7 @@ with tabs[2]:
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             in_path = td / "in.docx"
-            # ⚠️ 不要用 .read()（会消耗 UploadedFile 的指针，导致后续同一文件无法复用）
-            in_path.write_bytes(docx_file2.getvalue())
+            in_path.write_bytes(docx_file2.read())
 
             extra_args = []
             if wrap_none:
@@ -2027,80 +2015,53 @@ with tabs[2]:
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
                 st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
 
-    # ------------------------------------------------------------
-    # ③-补充功能：把文本公式 $...$ / $$...$$ 转回可编辑 Word 公式（OMML）
-    # ------------------------------------------------------------
-    st.divider()
-    st.subheader("把文档中的 .../... 文本公式转为可编辑 Word 公式（OMML）")
-    st.caption(
-        "适用场景：你在 Word 里手打了 $...$（或 $$...$$）占位公式，"
-        "希望一键转成可编辑的原生公式对象（OMML）。实现方式：docx → pandoc markdown → docx（用原文档作为 reference-doc 尽量保留样式）。"
-    )
 
-    if st.button("生成：EditableEquations.docx", disabled=not docx_file2, key="btn_make_omml"):
+
+    st.markdown("---")
+    st.subheader("把文档中的 ... / ... 文本公式转为可编辑 Word 公式（OMML）")
+    st.caption("适用场景：你在 Word 里手打了 $...$（或 $$...$$）作为占位公式，想一键转成可编辑的原生公式对象（OMML）。实现方式：docx → pandoc markdown → docx（用原文档作为 reference-doc 尽量保留样式）。")
+    docx_file3 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_omml_roundtrip")
+    if st.button("生成：EditableEquations.docx", key="btn_omml_roundtrip", disabled=not docx_file3):
         try:
-            raw_bytes = docx_file2.getvalue()
-            out_docx = docx_roundtrip_make_equations_editable(raw_bytes)
-            st.success("已生成，可下载。")
+            out_docx_bytes = docx_roundtrip_make_equations_editable(docx_file3.read())
             st.download_button(
                 "下载 EditableEquations.docx",
-                data=out_docx,
+                data=out_docx_bytes,
                 file_name="EditableEquations.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_make_omml",
+                key="dl_omml_roundtrip",
             )
-        except Exception as e:
-            st.error(f"生成失败：{type(e).__name__}: {e}")
-st.markdown("---")
-st.subheader("AI 增强：DOCX 文本 → 类似图片 OCR 的公式风格 → 再转 OMML / Pandoc")
-st.caption("思路：先用 Pandoc 把 docx 里的公式变成 $...$/$$...$$ 文本，再交给模型做“只改公式不改正文”的校正，最后再用 Pandoc 写回 Word（OMML）。对少量顽固公式通常更稳。")
-
-enable_ai = st.checkbox("开启 AI 公式校正（更慢但更准）", value=False, key="ai_math_clean_enable")
-ai_model = st.text_input("AI 校正使用的 model（默认用 OCR model）", value=st.session_state.get("ocr_model_id",""), key="ai_math_clean_model")
-max_batch_chars_ai = st.number_input("AI 每次输入最大字符数（自动分段）", min_value=2000, max_value=20000, value=8000, step=500, key="ai_math_clean_max_chars")
-out_tokens_ai = st.number_input("AI 输出 tokens 上限", min_value=512, max_value=16000, value=4096, step=256, key="ai_math_clean_out_tokens")
-
-docx_file4 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_omml_ai_roundtrip")
-col_ai1, col_ai2 = st.columns([1, 1])
-with col_ai1:
-    if st.button("生成：AI_EditableEquations.docx", key="btn_omml_ai_roundtrip", disabled=not docx_file4):
-        try:
-            if not enable_ai:
-                # 如果没开 AI，就直接走原本的 roundtrip
-                out_docx_bytes = docx_roundtrip_make_equations_editable(docx_file4.read())
-                st.download_button(
-                    "下载 AI_EditableEquations.docx",
-                    data=out_docx_bytes,
-                    file_name="AI_EditableEquations.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dl_omml_ai_roundtrip_noai",
-                )
-                st.success("已生成：AI_EditableEquations.docx（未开启 AI，走原 roundtrip）")
-            else:
-                client2 = OpenAI(
-                    api_key=os.environ.get("ARK_API_KEY", "").strip() or st.secrets.get("ARK_API_KEY", ""),
-                    base_url=(os.environ.get("ARK_BASE_URL") or st.secrets.get("ARK_BASE_URL","https://ark.cn-beijing.volces.com/api/v3")).strip(),
-                )
-                out_docx_bytes, cleaned_md = docx_ai_roundtrip_make_equations_editable(
-                    docx_file4.read(),
-                    client=client2,
-                    model=(ai_model or st.session_state.get("ocr_model_id","")).strip(),
-                    max_batch_chars=int(max_batch_chars_ai),
-                    timeout_s=int(st.session_state["ocr_timeout_s"]),
-                    out_tokens=int(out_tokens_ai),
-                )
-                st.download_button(
-                    "下载 AI_EditableEquations.docx",
-                    data=out_docx_bytes,
-                    file_name="AI_EditableEquations.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dl_omml_ai_roundtrip",
-                )
-                with st.expander("查看 AI 校正后的 Markdown（可用于排查）", expanded=False):
-                    st.code(cleaned_md[:8000] + ("\n...\n" if len(cleaned_md) > 8000 else ""), language="markdown")
-                st.success("已生成：AI_EditableEquations.docx（AI 校正 + OMML）")
+            st.success("已生成：EditableEquations.docx（公式已转为可编辑 OMML）")
         except Exception as e:
             st.error(f"生成失败：{type(e).__name__}: {e}")
 
-with col_ai2:
-    st.write("提示：如果你只想拿到“图片 OCR 风格”的 Markdown，可以先导出 markdown（上面导出功能），再手动粘贴进这里的 AI 校正。")
+
+
+# ============================================================
+# 9) Cache-enabled wrappers (keep old call sites unchanged)
+# ============================================================
+def docx_to_pandoc_markdown_for_math(docx_bytes: bytes) -> str:
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_docx_to_md_for_math(sha, docx_bytes)
+
+def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_roundtrip_omml(sha, docx_bytes)
+
+def docx_roundtrip_make_equations_editable_with_md(docx_bytes: bytes):
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_roundtrip_omml_with_md(sha, docx_bytes)
+
+def docx_ai_roundtrip_make_equations_editable(
+    docx_bytes: bytes,
+    *,
+    model: str,
+    max_batch_chars: int,
+    timeout_s: int,
+    out_tokens: int,
+    base_url: str,
+):
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_ai_roundtrip(
+        sha, docx_bytes, model, int(max_batch_chars), int(timeout_s), int(out_tokens), str(base_url)
+    )
