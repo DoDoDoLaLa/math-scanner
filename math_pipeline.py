@@ -207,6 +207,15 @@ def pandoc_markdown_to_docx(md: str, *, reference_docx_bytes: Optional[bytes] = 
         return out_path.read_bytes()
 
 
+
+
+def pandoc_markdown_to_latex(md: str) -> str:
+    """Markdown(+tex_math_dollars) -> LaTeX string (for export)."""
+    ensure_pandoc()
+    md = normalize_md(md) + "\n"
+    return pypandoc.convert_text(md, to="latex", format="markdown+tex_math_dollars")
+
+
 def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> Tuple[bytes, str]:
     """DOCX -> MD(tex_math_dollars) -> sanitize -> DOCX (Pandoc emits OMML). Returns (out_docx, md_used)."""
     md = docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
