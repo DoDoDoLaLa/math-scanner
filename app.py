@@ -1356,6 +1356,45 @@ def normalize_math_text_style(md: str) -> str:
     return md2
 
 
+
+
+def _sanitize_tex_math_for_pandoc(md: str) -> str:
+    """Make TeX math in Markdown more pandoc-friendly before markdown->docx.
+
+    Why this exists:
+    - Pandoc's TeX math with $$...$$ does *not* allow blank lines inside the block,
+      otherwise it may terminate display math early and the remainder becomes normal text. 
+    - When coming from DOCX, pandoc's markdown writer can escape backslashes as
+      \\alpha (meaning \alpha). Inside math, we want to unescape command starters
+      (\\alpha -> \alpha) but keep real LaTeX linebreaks (\\) intact.
+
+    We only touch content *inside* $...$ / $$...$$.
+    """
+    if not md:
+        return md
+
+    def _fix_math_body(body: str) -> str:
+        # 1) remove blank lines inside display math
+        body = re.sub(r"\n[ \t]*\n+", "\n", body)
+
+        # 2) unescape backslashes only when it's likely a command starter:
+        #    \\alpha, \\rho, \\_, \\{  -> \alpha, \rho, \_, \{
+        #    but keep \\ (linebreak) when followed by whitespace/newline.
+        body = re.sub(r"\\\\(?=[A-Za-z_{])", r"\\", body)
+        return body
+
+    def _disp(m):
+        body = _fix_math_body(m.group(1)).strip(" \n\t")
+        return "$$\n" + body + "\n$$"
+
+    def _inline(m):
+        body = _fix_math_body(m.group(1)).replace("\n", " ").strip()
+        return "$" + body + "$"
+
+
+    md2 = MATH_DOLLAR_BLOCK_RE.sub(_disp, md)
+    md2 = MATH_DOLLAR_INLINE_RE.sub(_inline, md2)
+    return md2
 # ============================================================
 # 7.6) DOCX round-trip: $...$ / $$...$$ text math -> editable Word equations (OMML)
 #      (Pandoc parses TeX math and writes OMML)
