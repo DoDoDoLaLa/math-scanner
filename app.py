@@ -1269,55 +1269,7 @@ def pandoc_md_to_docx(md: str) -> bytes:
         return out.read_bytes()
 
 
-def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
-    """Round-trip a DOCX through Pandoc Markdown to convert $...$/$$...$$ into native Word equations (OMML).
-
-    Why this works (high level):
-    - docx -> markdown: keep math delimiters in plain text
-    - markdown -> docx (markdown+tex_math_dollars): Pandoc parses TeX math and writes OMML equations
-
-    Notes:
-    - We post-process pandoc's markdown escapes so TeX math stays valid (e.g. '\$' -> '$', '\\alpha' -> '\alpha').
-    - We pass '--reference-doc' to preserve the original docx styles as much as pandoc supports.
-    """
-    if not docx_bytes:
-        return docx_bytes
-
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        in_path = td / "in.docx"
-        in_path.write_bytes(docx_bytes)
-
-        extra_args = ["--wrap=none"]
-
-        # 1) docx -> markdown (keep $...$/$$...$$ as-is in text)
-        md = pypandoc.convert_file(
-            str(in_path),
-            to="markdown+tex_math_dollars",
-            format="docx",
-            extra_args=extra_args,
-        )
-
-        # 2) Undo pandoc's escaping so TeX math remains parseable in the next step.
-        #    This is intentionally a bit aggressive for academic docs (rarely contain literal dollars).
-        md = md.replace(r"\$", "$")
-        md = md.replace("\\\\", "\\")
-
-        # 3) Make delimiters consistent (helps pandoc parse display/inline math reliably)
-        md = normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
-        md = normalize_math_text_style(md)  
-        # 4) markdown -> docx, using original doc as reference style template
-        out_path = td / "out.docx"
-        pypandoc.convert_text(
-            md,
-            to="docx",
-            format="markdown+tex_math_dollars",
-            outputfile=str(out_path),
-            extra_args=["--reference-doc", str(in_path)],
-        )
-        return out_path.read_bytes()
-
-
+# ============================================================
 # ============================================================
 # 7.5) Pandoc math normalization helpers (for thesis-friendly editing)
 # ============================================================
@@ -1334,49 +1286,13 @@ def normalize_pandoc_math(
 ) -> str:
     """Normalize math delimiters produced by pandoc for easier paper editing.
 
-    - Pandoc LaTeX writer commonly emits inline math as \(...\) and display math as \[...\].
+    - Pandoc LaTeX writer commonly emits inline math as \(..\) and display math as \[..\].
     - Some sources may already contain $$...$$. We normalize both.
-    - display_style:
-        - equation  : \begin{equation} ... \end{equation} (numbered)
-        - equation* : \begin{equation*} ... \end{equation*} (unnumbered)
-        - bracket   : \[ ... \]
-        - dollars   : $$ ... $$
-    - inline_style:
-        - paren     : \( ... \)
-        - dollars   : $ ... $
     """
     if not text:
         return text
 
     t = text.replace("\r\n", "\n").replace("\r", "\n")
-MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
-MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
-
-# 下标/上标是纯字母且长度>=2 -> 认为是“文本语义”，转成 \mathrm{...}
-SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
-
-def _fix_subsup_text_style_in_math(expr: str) -> str:
-    # 跳过已经是 _{...} 或 ^{...} 的
-    def repl(m):
-        op = m.group(1)  # _ or ^
-        word = m.group(2)
-        return f"{op}{{\\mathrm{{{word}}}}}"
-    return SUBSUP_TEXT_RE.sub(repl, expr)
-
-def normalize_math_text_style(md: str) -> str:
-    def fix_block(m):
-        body = m.group(1)
-        body2 = _fix_subsup_text_style_in_math(body)
-        return "$$\n" + body2.strip() + "\n$$"
-
-    def fix_inline(m):
-        body = m.group(1)
-        body2 = _fix_subsup_text_style_in_math(body)
-        return "$" + body2.strip() + "$"
-
-    md = MATH_DOLLAR_BLOCK_RE.sub(fix_block, md)
-    md = MATH_DOLLAR_INLINE_RE.sub(fix_inline, md)
-    return md
 
     def _to_equation(body: str, starred: bool) -> str:
         env = "equation*" if starred else "equation"
@@ -1391,7 +1307,6 @@ def normalize_math_text_style(md: str) -> str:
             return _to_equation(body, starred=True)
         if display_style == "dollars":
             return f"$$\n{body}\n$$"
-        # bracket
         return f"\\[\n{body}\n\\]"
 
     # Normalize display math first (both \[\] and $$ $$)
@@ -1407,11 +1322,39 @@ def normalize_math_text_style(md: str) -> str:
     # Normalize inline math (both \(\) and $ $)
     t = PANDOC_INLINE_MATH_PAREN_RE.sub(_inline_repl, t)
     t = PANDOC_INLINE_MATH_DOLLAR_RE.sub(lambda m: _inline_repl(m), t)
-
     return t
 
 
-# ============================================================
+# ---- Optional: improve Word OMML visual fidelity for "text-like" subscripts/superscripts ----
+# Example: P_seed  -> P_{\mathrm{seed}}
+MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
+MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
+SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
+
+def _fix_subsup_text_style_in_math(expr: str) -> str:
+    def repl(m):
+        op = m.group(1)  # _ or ^
+        word = m.group(2)
+        return f"{op}{{\\mathrm{{{word}}}}}"
+    return SUBSUP_TEXT_RE.sub(repl, expr)
+
+def normalize_math_text_style(md: str) -> str:
+    """Heuristic: inside $...$/$$...$$ convert bare multi-letter subscripts/superscripts to \mathrm{...}."""
+    if not md:
+        return md
+
+    def fix_block(m):
+        body2 = _fix_subsup_text_style_in_math(m.group(1))
+        return "$$\n" + body2.strip() + "\n$$"
+
+    def fix_inline(m):
+        body2 = _fix_subsup_text_style_in_math(m.group(1))
+        return "$" + body2.strip() + "$"
+
+    md2 = MATH_DOLLAR_BLOCK_RE.sub(fix_block, md)
+    md2 = MATH_DOLLAR_INLINE_RE.sub(fix_inline, md2)
+    return md2
+
 # 8) UI: sidebar
 # ============================================================
 ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
@@ -1870,20 +1813,3 @@ with tabs[2]:
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
                 st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
 
-
-    st.divider()
-    st.subheader("把文档中的 $...$ / $$...$$ 文本公式转为可编辑 Word 公式（OMML）")
-    st.caption(
-        "适用场景：你在 Word 里手打了 $$...$$（或 $...$）作为占位公式，想一键转成可编辑的原生公式对象。\n"
-        "实现方式：docx → pandoc markdown → docx（用原文档作为 reference-doc 尽量保留样式）。"
-    )
-
-    if st.button("生成：EditableEquations.docx", type="primary", key="btn_math2omml", disabled=not docx_file2):
-        raw_bytes = docx_file2.getvalue() if hasattr(docx_file2, "getvalue") else docx_file2.read()
-        out_docx = docx_roundtrip_make_equations_editable(raw_bytes)
-        st.success("已生成可编辑公式版本（EditableEquations.docx）")
-        st.download_button(
-            "下载 EditableEquations.docx",
-            data=out_docx,
-            file_name="EditableEquations.docx",
-        )
