@@ -1285,6 +1285,49 @@ AI_MATH_CLEAN_PROMPT_ZH = """你是论文排版助理。请把我给你的 Markd
 4) 不要输出解释，不要输出代码块围栏，不要输出 JSON。只输出修正后的 Markdown 纯文本。
 """
 
+def _sanitize_tex_math_for_pandoc(md: str) -> str:
+    """Best-effort sanitizer so Pandoc can reliably parse TeX math.
+
+    - Do not rewrite normal text.
+    - Ensure $$...$$ blocks have no blank lines (Pandoc can mis-parse).
+    - Normalize some common escaping patterns from DOCX->Markdown conversions.
+    """
+    if not md:
+        return md
+
+    t = md.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.replace("\u00A0", " ")  # NBSP
+
+    # Common over-escaping for dollar signs
+    t = t.replace(r"\\$", "$")
+    t = t.replace(r"\$", "$")
+
+    block_re = re.compile(r"(?s)\$\$(.+?)\$\$")
+    inline_re = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
+
+    def _clean_body(body: str, is_block: bool) -> str:
+        b = (body or "").strip()
+        if is_block:
+            b = re.sub(r"\n\s*\n+", "\n", b)  # collapse blank lines
+            b = re.sub(r"[ \t]+\n", "\n", b)    # trim line-end spaces
+        else:
+            b = b.replace("\n", " ")
+            b = re.sub(r"\s{2,}", " ", b)
+        return b.strip()
+
+    def _fix_block(m):
+        b = _clean_body(m.group(1), True)
+        return "$$\n" + b + "\n$$"
+
+    def _fix_inline(m):
+        b = _clean_body(m.group(1), False)
+        return "$" + b + "$"
+
+    t = block_re.sub(_fix_block, t)
+    t = inline_re.sub(_fix_inline, t)
+    return t
+
+
 def docx_to_pandoc_markdown_for_math(docx_bytes: bytes, wrap_none: bool = True) -> str:
     """DOCX -> Markdown(+tex_math_dollars) suitable for later math parsing."""
     if not docx_bytes:
@@ -1303,6 +1346,7 @@ def docx_to_pandoc_markdown_for_math(docx_bytes: bytes, wrap_none: bool = True) 
     md = (md or "").replace("\r\n", "\n").replace("\r", "\n")
 
     # Undo common escaping patterns that break TeX math parsing
+    md = md.replace(r"\$", "$")
     md = md.replace(r"\\$", "$")
     md = md.replace("\\\\", "\\")  # DOCX writer often escapes backslashes
     md = normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
