@@ -2023,7 +2023,9 @@ with tabs[2]:
     docx_file3 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_omml_roundtrip")
     if st.button("生成：EditableEquations.docx", key="btn_omml_roundtrip", disabled=not docx_file3):
         try:
-            out_docx_bytes = docx_roundtrip_make_equations_editable(docx_file3.read())
+            # 统一 getvalue() 读取，避免 UploadedFile.read() 二次读取为空
+            in_bytes = read_uploaded_bytes(docx_file3)
+            out_docx_bytes = docx_roundtrip_make_equations_editable(in_bytes)
             st.download_button(
                 "下载 EditableEquations.docx",
                 data=out_docx_bytes,
@@ -2032,6 +2034,91 @@ with tabs[2]:
                 key="dl_omml_roundtrip",
             )
             st.success("已生成：EditableEquations.docx（公式已转为可编辑 OMML）")
+        except Exception as e:
+            st.error(f"生成失败：{type(e).__name__}: {e}")
+
+
+    st.markdown("---")
+    st.subheader("AI 增强：DOCX 文本 → 类似图片 OCR 的公式风格 → 再转 OMML / Pandoc")
+    st.caption(
+        "思路：先用 Pandoc 把 docx 里的公式变成 $...$ / $$...$$ 文本，再交给模型做“只改公式不改正文”的校正，"
+        "最后再用 Pandoc 写回 Word（OMML）。这能显著减少少量顽固公式的格式异常。"
+    )
+
+    enable_ai_fix = st.checkbox("开启 AI 公式校正（更慢但更准）", value=False, key="ai_fix_enable")
+
+    col_ai1, col_ai2 = st.columns([2, 1])
+    with col_ai1:
+        ai_model = st.text_input(
+            "AI 校正使用的 model（默认用 OCR model）",
+            value=st.session_state.get("ocr_model_id", "").strip(),
+            key="ai_fix_model",
+            disabled=not enable_ai_fix,
+        )
+        max_batch_chars = st.number_input(
+            "AI 每次输入最大字符数（自动分段）",
+            min_value=2000,
+            max_value=30000,
+            value=8000,
+            step=500,
+            disabled=not enable_ai_fix,
+        )
+    with col_ai2:
+        ai_out_tokens = st.number_input(
+            "AI 输出 tokens 上限",
+            min_value=512,
+            max_value=8192,
+            value=int(st.session_state.get("out_tokens", 4096)),
+            step=256,
+            disabled=not enable_ai_fix,
+        )
+        ai_timeout_s = st.number_input(
+            "AI 单次请求超时（秒）",
+            min_value=30,
+            max_value=600,
+            value=int(st.session_state.get("ocr_timeout_s", 120)),
+            step=10,
+            disabled=not enable_ai_fix,
+        )
+
+    docx_file_ai = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_ai_roundtrip")
+
+    if st.button("生成：AI_EditableEquations.docx", key="btn_ai_roundtrip", disabled=not (enable_ai_fix and docx_file_ai)):
+        try:
+            if not ai_model.strip():
+                st.error("AI model 为空：请在侧边栏填写 OCR model，或在此处手动填写。")
+                st.stop()
+
+            in_bytes = read_uploaded_bytes(docx_file_ai)
+            if not in_bytes:
+                st.error("上传文件为空（可能重复点击导致 read() 被消费）。请重新上传或刷新页面。")
+                st.stop()
+
+            sha = mp.sha256_bytes(in_bytes)
+
+            with st.spinner("AI 校正 + Pandoc 回写中…（首次可能较慢，后续同文件会走缓存）"):
+                out_docx_bytes, md_used = _cached_ai_roundtrip(
+                    sha,
+                    in_bytes,
+                    model=ai_model.strip(),
+                    max_batch_chars=int(max_batch_chars),
+                    timeout_s=int(ai_timeout_s),
+                    out_tokens=int(ai_out_tokens),
+                    base_url=str(get_ark_base_url()),
+                )
+
+            st.download_button(
+                "下载 AI_EditableEquations.docx",
+                data=out_docx_bytes,
+                file_name="AI_EditableEquations.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_ai_roundtrip",
+            )
+            with st.expander("查看 AI 校正后用于 Pandoc 的 Markdown（调试用）", expanded=False):
+                st.code((md_used or "")[:12000] + ("\n...\n" if (md_used and len(md_used) > 12000) else ""), language="markdown")
+
+            st.success("已生成：AI_EditableEquations.docx")
+
         except Exception as e:
             st.error(f"生成失败：{type(e).__name__}: {e}")
 
