@@ -1270,6 +1270,71 @@ def pandoc_md_to_docx(md: str) -> bytes:
 
 
 # ============================================================
+# 7.5) Pandoc math normalization helpers (for thesis-friendly editing)
+# ============================================================
+PANDOC_DISPLAY_MATH_BRACKET_RE = re.compile(r"(?s)\\\[(.+?)\\\]")  # \[ ... \]
+PANDOC_DISPLAY_MATH_DOLLAR_RE = re.compile(r"(?s)\$\$(.+?)\$\$")    # $$ ... $$
+PANDOC_INLINE_MATH_PAREN_RE = re.compile(r"(?s)\\\((.+?)\\\)")    # \( ... \)
+PANDOC_INLINE_MATH_DOLLAR_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")  # $ ... $
+
+def normalize_pandoc_math(
+    text: str,
+    *,
+    display_style: str = "equation",   # equation | equation* | bracket | dollars
+    inline_style: str = "paren",       # paren | dollars
+) -> str:
+    """Normalize math delimiters produced by pandoc for easier paper editing.
+
+    - Pandoc LaTeX writer commonly emits inline math as \(...\) and display math as \[...\].
+    - Some sources may already contain $$...$$. We normalize both.
+    - display_style:
+        - equation  : \begin{equation} ... \end{equation} (numbered)
+        - equation* : \begin{equation*} ... \end{equation*} (unnumbered)
+        - bracket   : \[ ... \]
+        - dollars   : $$ ... $$
+    - inline_style:
+        - paren     : \( ... \)
+        - dollars   : $ ... $
+    """
+    if not text:
+        return text
+
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _to_equation(body: str, starred: bool) -> str:
+        env = "equation*" if starred else "equation"
+        body = body.strip()
+        return f"\\begin{{{env}}}\n{body}\n\\end{{{env}}}"
+
+    def _display_repl(m):
+        body = (m.group(1) or "").strip()
+        if display_style == "equation":
+            return _to_equation(body, starred=False)
+        if display_style == "equation*":
+            return _to_equation(body, starred=True)
+        if display_style == "dollars":
+            return f"$$\n{body}\n$$"
+        # bracket
+        return f"\\[\n{body}\n\\]"
+
+    # Normalize display math first (both \[\] and $$ $$)
+    t = PANDOC_DISPLAY_MATH_BRACKET_RE.sub(_display_repl, t)
+    t = PANDOC_DISPLAY_MATH_DOLLAR_RE.sub(_display_repl, t)
+
+    def _inline_repl(m):
+        body = (m.group(1) or "").strip()
+        if inline_style == "dollars":
+            return f"${body}$"
+        return f"\\({body}\\)"
+
+    # Normalize inline math (both \(\) and $ $)
+    t = PANDOC_INLINE_MATH_PAREN_RE.sub(_inline_repl, t)
+    t = PANDOC_INLINE_MATH_DOLLAR_RE.sub(lambda m: _inline_repl(m), t)
+
+    return t
+
+
+# ============================================================
 # 8) UI: sidebar
 # ============================================================
 ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
@@ -1645,6 +1710,7 @@ with tabs[1]:
         st.download_button("下载 new.docx", data=out_docx_bytes, file_name="new.docx")
 
 
+
 # ---------------------------
 # Tab 3: DOCX -> LaTeX/Markdown export (recommended)
 # ---------------------------
@@ -1657,6 +1723,28 @@ with tabs[2]:
     out_format = st.selectbox("导出格式", ["latex (.tex)", "markdown (.md)"], index=0)
     wrap_none = st.checkbox("wrap=none（不自动换行）", value=True)
 
+    # ✅ 新增：把 pandoc 默认的 \[...\]/\(...\) 统一成更“论文友好”的格式
+    st.markdown("**公式输出格式（可选）**")
+    col_m1, col_m2 = st.columns([1, 1])
+    with col_m1:
+        display_style = st.selectbox(
+            "行间公式（display math）",
+            ["equation（带编号）", "equation*（不编号）", "bracket（\\[...\\]）", "dollars（$$...$$）"],
+            index=0,
+            help="pandoc 默认常用 \\[...\\]。论文通常更喜欢 equation/equation*，便于统一编号与引用。",
+        )
+    with col_m2:
+        inline_style = st.selectbox(
+            "行内公式（inline math）",
+            ["paren（\\(...\\)）", "dollars（$...$）"],
+            index=0,
+            help="pandoc 默认常用 \\(...\\)。如果你后续要在 Markdown 里编辑，可能更喜欢 $...$。",
+        )
+
+    # 映射到 normalize_pandoc_math 的参数值
+    display_style_key = display_style.split("（", 1)[0].strip()
+    inline_style_key = inline_style.split("（", 1)[0].strip()
+
     if st.button("导出", type="primary", disabled=not docx_file2):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -1668,10 +1756,39 @@ with tabs[2]:
                 extra_args += ["--wrap=none"]
 
             if out_format.startswith("latex"):
-                out_text = pypandoc.convert_file(str(in_path), to="latex", format="docx", extra_args=extra_args)
+                # docx -> latex
+                out_text = pypandoc.convert_file(
+                    str(in_path),
+                    to="latex",
+                    format="docx",
+                    extra_args=extra_args,
+                )
+                # 统一公式风格（\[\] / $$ $$ / \(\) / $ $）
+                out_text = normalize_pandoc_math(
+                    out_text,
+                    display_style=display_style_key,
+                    inline_style=("dollars" if inline_style_key.startswith("dollars") else "paren"),
+                )
+
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="latex")
                 st.download_button("下载 .tex", data=out_text.encode("utf-8"), file_name="export.tex")
             else:
-                out_text = pypandoc.convert_file(str(in_path), to="markdown", format="docx", extra_args=extra_args)
+                # docx -> markdown
+                # 关键：显式打开 tex_math_dollars 扩展，保证 $...$ / $$...$$ 被当作数学处理
+                # Pandoc 支持通过 format name +EXTENSION 来启用扩展（见官方手册）。
+                out_text = pypandoc.convert_file(
+                    str(in_path),
+                    to="markdown+tex_math_dollars",
+                    format="docx",
+                    extra_args=extra_args,
+                )
+
+                # Markdown 输出也可按同一套规则统一（通常建议保留 dollars 方便后续编辑）
+                out_text = normalize_pandoc_math(
+                    out_text,
+                    display_style=display_style_key,
+                    inline_style=("dollars" if inline_style_key.startswith("dollars") else "paren"),
+                )
+
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
                 st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
