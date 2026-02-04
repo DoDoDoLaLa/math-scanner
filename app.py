@@ -1044,6 +1044,46 @@ def ark_translate_text_via_responses(
     raise TranslateCallError(f"translate failed after retries: {last_err}")
 
 
+
+
+# ---------------------------
+# Translation quality guard (auto-retry when a segment looks "not translated")
+# ---------------------------
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+def _has_cjk(s: str) -> bool:
+    return bool(_CJK_RE.search(s or ""))
+
+def _has_latin(s: str) -> bool:
+    return bool(_LATIN_RE.search(s or ""))
+
+def _looks_untranslated(src: str, out: str, dst_lang: str) -> bool:
+    """Heuristic: if dst is English but output still contains CJK, or
+    dst is Chinese but output still contains lots of Latin letters,
+    treat as not translated and retry with explicit source language."""
+    if not src or not out:
+        return False
+    # exact same (after whitespace) is a strong signal
+    if re.sub(r"\s+", " ", src).strip() == re.sub(r"\s+", " ", out).strip():
+        if dst_lang in ("English", "en"):
+            return _has_cjk(out)
+        if dst_lang in ("Chinese", "zh"):
+            return _has_latin(out)
+    # output still has too much source-language signal
+    if dst_lang in ("English", "en"):
+        return _has_cjk(out)
+    if dst_lang in ("Chinese", "zh"):
+        return _has_latin(out) and not _has_cjk(out)
+    return False
+
+def _force_src_for_retry(src: str, dst_lang: str):
+    if dst_lang in ("English", "en") and _has_cjk(src):
+        return "Chinese"
+    if dst_lang in ("Chinese", "zh") and _has_latin(src) and not _has_cjk(src):
+        return "English"
+    return None
+
 def doubao_translate_items(
     client: OpenAI,
     model: str,
@@ -1098,6 +1138,27 @@ def doubao_translate_items(
             retries=6,
             on_attempt=on_attempt,
         )
+
+        # If the translation API returns the original text (or leaves obvious source-language residue),
+        # retry once with an explicit source language to improve recall on mixed-language segments.
+        if _looks_untranslated(seg, translated, dst_lang):
+            forced_src = _force_src_for_retry(seg, dst_lang)
+            if forced_src and forced_src != src_lang:
+                translated2 = ark_translate_text_via_responses(
+                    api_key=api_key,
+                    base_url=base_url,
+                    text=seg,
+                    src_lang=forced_src,
+                    dst_lang=dst_lang,
+                    timeout_s=timeout_s,
+                    model=translate_model,
+                    retries=6,
+                    on_attempt=on_attempt,
+                )
+                # only accept retry if it improves the target-language signal
+                if not _looks_untranslated(seg, translated2, dst_lang):
+                    translated = translated2
+
         if debug_sink:
             debug_sink(translated[:400])
         return _id, j, translated
