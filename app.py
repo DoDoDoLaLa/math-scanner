@@ -1305,7 +1305,7 @@ def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
 
         # 3) Make delimiters consistent (helps pandoc parse display/inline math reliably)
         md = normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
-
+        md = normalize_math_text_style(md)  
         # 4) markdown -> docx, using original doc as reference style template
         out_path = td / "out.docx"
         pypandoc.convert_text(
@@ -1349,6 +1349,34 @@ def normalize_pandoc_math(
         return text
 
     t = text.replace("\r\n", "\n").replace("\r", "\n")
+MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
+MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
+
+# 下标/上标是纯字母且长度>=2 -> 认为是“文本语义”，转成 \mathrm{...}
+SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
+
+def _fix_subsup_text_style_in_math(expr: str) -> str:
+    # 跳过已经是 _{...} 或 ^{...} 的
+    def repl(m):
+        op = m.group(1)  # _ or ^
+        word = m.group(2)
+        return f"{op}{{\\mathrm{{{word}}}}}"
+    return SUBSUP_TEXT_RE.sub(repl, expr)
+
+def normalize_math_text_style(md: str) -> str:
+    def fix_block(m):
+        body = m.group(1)
+        body2 = _fix_subsup_text_style_in_math(body)
+        return "$$\n" + body2.strip() + "\n$$"
+
+    def fix_inline(m):
+        body = m.group(1)
+        body2 = _fix_subsup_text_style_in_math(body)
+        return "$" + body2.strip() + "$"
+
+    md = MATH_DOLLAR_BLOCK_RE.sub(fix_block, md)
+    md = MATH_DOLLAR_INLINE_RE.sub(fix_inline, md)
+    return md
 
     def _to_equation(body: str, starred: bool) -> str:
         env = "equation*" if starred else "equation"
