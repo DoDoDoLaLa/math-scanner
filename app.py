@@ -214,15 +214,15 @@ def _translate_markdown_ocr_style(
         if attempt_msg_cb:
             attempt_msg_cb(f"Pandoc 翻译批次 {bi}/{total}：items={len(batch)}")
 
-        translated_map = translate_items_adaptive(
+        translated_map = llm_translate_items_json(
             client=client,
             model=model,
             items=batch,
             src_lang=src_lang,
             dst_lang=dst_lang,
             timeout_s=timeout_s,
+            retries=6,
             on_attempt=(lambda a, n, ph: attempt_msg_cb(f"Pandoc 批次 {bi}/{total}：尝试 {a}/{n} · {ph}") if attempt_msg_cb else None),
-            debug_sink=None,
         )
         translated_map_all.update(translated_map)
 
@@ -266,7 +266,7 @@ def _cached_pandoc_translate_ocr_route(
     md_tr, stats = _translate_markdown_ocr_style(
         md,
         client=client,
-        model=DEFAULT_TRANSLATE_MODEL,
+        model=get_default_model(),
         src_lang=src_lang,
         dst_lang=dst_lang,
         timeout_s=int(timeout_s),
@@ -307,6 +307,81 @@ TRANSLATE_PROMPT_TEMPLATE = r"""
 - 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{ }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
 - LaTeX 代码、公式环境（如 \begin{equation}...\end{equation} 或 $...$）不得改动。
 - 不要添加多余字段、不要输出解释、不要 Markdown。
+def llm_translate_items_json(
+    *,
+    client: OpenAI,
+    model: str,
+    items: List[dict],
+    src_lang: str,
+    dst_lang: str,
+    timeout_s: int,
+    retries: int = 6,
+    on_attempt: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, List[str]]:
+    """Translate a batch of items via chat model with strict JSON IO.
+
+    This is used ONLY by the 'Pandoc 中转（OCR $$ 风格）' route so we can:
+    - force output to be Markdown (not extra prose)
+    - keep math placeholders untouched
+    - strongly discourage target-language drift (e.g., English output containing Chinese)
+    """
+    if not items:
+        return {}
+
+    prompt = TRANSLATE_PROMPT_TEMPLATE.replace("__SRC_LANG__", src_lang).replace("__DST_LANG__", dst_lang)
+
+    # Extra constraints for this route:
+    # - Output segments are plain Markdown text
+    # - Keep all math as-is and keep using $...$ / $$...$$ (no \(\), \[\], equation env)
+    prompt += (
+        "\n\n额外约束（必须遵守）：\n"
+        "- 你的每个 segments 输出都必须是 Markdown 正文（不要加标题、不要加解释）。\n"
+        "- 数学公式一律使用 $...$（行内）与 $$...$$（行间）；不要输出 \\( ... \\)、\\[ ... \\] 或 \\begin{equation}...\n"
+        "- 如果目标语言是 English/en：输出中不得出现中文（CJK 字符）。\n"
+    )
+
+    payload = {"items": items}
+    prompt += "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+
+    res = safe_chat_completions(
+        client=client,
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=8192,
+        timeout_s=timeout_s,
+        retries=retries,
+        on_attempt=on_attempt,
+        response_format={"type": "json_object"},
+    )
+    if res.error_message:
+        raise TranslateCallError(res.error_message, raw=None)
+
+    obj = extract_json_object(res.text)
+    if not isinstance(obj, dict) or "items" not in obj or not isinstance(obj.get("items"), list):
+        raise TranslateCallError("invalid JSON schema: missing items[]", raw=res.text[:800])
+
+    out_map: Dict[str, List[str]] = {}
+    for it in obj["items"]:
+        if not isinstance(it, dict):
+            continue
+        _id = it.get("id")
+        segs = it.get("segments")
+        if isinstance(_id, str) and isinstance(segs, list) and all(isinstance(s, str) for s in segs):
+            out_map[_id] = list(segs)
+
+    # Validate coverage & segment counts
+    for it in items:
+        _id = it.get("id")
+        segs = it.get("segments")
+        if not isinstance(_id, str) or not isinstance(segs, list):
+            continue
+        if _id not in out_map:
+            raise TranslateCallError(f"missing translated item: {_id}", raw=res.text[:800])
+        if len(out_map[_id]) != len(segs):
+            raise TranslateCallError(f"segments length mismatch for {_id}: {len(out_map[_id])} != {len(segs)}", raw=res.text[:800])
+
+    return out_map
 """.strip()
 
 
