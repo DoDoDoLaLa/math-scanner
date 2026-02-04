@@ -22,6 +22,125 @@ import streamlit as st
 def _has_cjk(s: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
 
+# --- Academic features: glossary + post-translation QA (auto-retry) ---
+GLOSS_PLACEHOLDER_RE = re.compile(r"__GLOSS\d+__")
+
+def parse_glossary_mapping(text: str) -> Dict[str, str]:
+    """Parse glossary lines into dict.
+    Supported formats per line:
+    - src => dst
+    - src -> dst
+    - src\t dst
+    - src,dst   (only if exactly 2 columns)
+    Blank lines / comment lines (# ...) are ignored.
+    """
+    mapping: Dict[str, str] = {}
+    if not text:
+        return mapping
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            parts = [p.strip() for p in line.split("\t") if p.strip()]
+        elif "=>" in line:
+            parts = [p.strip() for p in line.split("=>", 1)]
+        elif "->" in line:
+            parts = [p.strip() for p in line.split("->", 1)]
+        else:
+            parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        mapping[parts[0]] = parts[1]
+    return mapping
+
+def apply_glossary_placeholders(text: str, glossary: Dict[str, str]) -> Tuple[str, Dict[str, str]]:
+    """Replace glossary source terms with stable placeholders so the model keeps them unchanged,
+    then we restore them to the desired target terms after translation.
+    Returns (text_with_placeholders, placeholder_to_target).
+    """
+    if not text or not glossary:
+        return text, {}
+    # Longest-first to avoid partial overlaps.
+    items = sorted(glossary.items(), key=lambda kv: len(kv[0]), reverse=True)
+    placeholder_to_target: Dict[str, str] = {}
+    out = text
+    for i, (src, tgt) in enumerate(items):
+        ph = f"__GLOSS{i}__"
+        if src in out:
+            out = out.replace(src, ph)
+            placeholder_to_target[ph] = tgt
+    return out, placeholder_to_target
+
+def restore_glossary_placeholders(text: str, placeholder_to_target: Dict[str, str]) -> str:
+    if not text or not placeholder_to_target:
+        return text
+    out = text
+    # Replace longer placeholders first (though they are uniform)
+    for ph, tgt in sorted(placeholder_to_target.items(), key=lambda kv: len(kv[0]), reverse=True):
+        out = out.replace(ph, tgt)
+    return out
+
+def qa_detect_issues(text: str, *, dst_lang: str, forbid_cjk_when_en: bool = True) -> List[str]:
+    issues: List[str] = []
+    t = text or ""
+    # 1) Leftover CJK when target is English
+    if forbid_cjk_when_en and dst_lang in ("English", "en"):
+        if _has_cjk(t):
+            issues.append("CJK_LEFT")
+    # 2) Enforce $/$$ delimiters only (no \( \) \[ \] equation env) for this app's Pandoc stability
+    if re.search(r"\\\(|\\\)|\\\[|\\\]", t):
+        issues.append("MATH_DELIMS_NOT_DOLLARS")
+    if re.search(r"\\begin\{equation\*?\}", t):
+        issues.append("EQUATION_ENV_FOUND")
+    # 3) Placeholder leaks (glossary)
+    if GLOSS_PLACEHOLDER_RE.search(t):
+        issues.append("GLOSSARY_PLACEHOLDER_LEAK")
+    return issues
+
+def llm_translate_with_qa(
+    *,
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    timeout_s: int,
+    base_retries: int = 6,
+    qa_retries: int = 2,
+    dst_lang: str,
+) -> str:
+    """Call LLM, then run simple QA; if issues exist, auto-retry with a repair prompt."""
+    last_text = ""
+    for attempt in range(qa_retries + 1):
+        res = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=8192,
+            timeout_s=int(timeout_s),
+            retries=int(base_retries),
+        )
+        if res.error_message:
+            raise TranslateCallError(res.error_message, raw=None)
+        text = (res.text or "").strip()
+        last_text = text
+        issues = qa_detect_issues(text, dst_lang=dst_lang)
+        if not issues:
+            return text
+        # Build a minimal repair prompt: keep structure, keep formulas, remove forbidden patterns.
+        prompt = (
+            "你刚才的翻译输出存在质量问题，需要你在不改变含义/结构的前提下修复并重新输出。\n"
+            "严格要求：\n"
+            "- 只输出修复后的正文（不要解释，不要额外字段）。\n"
+            "- 数学公式一律使用 $...$（行内）与 $$...$$（行间），不要使用 \\(..\\)、\\[..\\] 或 equation 环境。\n"
+            "- 如果目标语言是 English/en，则输出中不得出现中文/CJK 字符。\n\n"
+            f"问题：{', '.join(issues)}\n\n"
+            "【原始提示】\n" + prompt + "\n\n"
+            "【你上一次的输出】\n" + text + "\n\n"
+            "请直接给出修复后的最终输出："
+        )
+    return last_text
+
 from PIL import Image, ImageFilter, ImageOps
 
 from openai import OpenAI
@@ -137,6 +256,9 @@ def _cached_ai_roundtrip(
         docx_bytes,
         call_llm=call_llm,
         max_batch_chars=int(max_batch_chars),
+        glossary_map=parse_glossary_mapping(st.session_state.get("glossary_text", "")),
+        enable_qa_retry=bool(st.session_state.get("qa_enable", True)),
+        qa_retries=int(st.session_state.get("qa_retries", 2)),
         progress_cb=None,
     )
 
@@ -231,6 +353,9 @@ def _translate_docx_direct_to_markdown_ocr_style(
     dst_lang: str,
     timeout_s: int,
     max_batch_chars: int,
+    glossary_map: Optional[Dict[str, str]] = None,
+    enable_qa_retry: bool = True,
+    qa_retries: int = 2,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     attempt_msg_cb: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -253,19 +378,35 @@ def _translate_docx_direct_to_markdown_ocr_style(
         if attempt_msg_cb:
             attempt_msg_cb(f"直接翻译批次 {i}/{total}（包含 OMML 公式标记，LLM 将转为 $/$$）")
 
-        prompt = base_prompt + "\n\n" + ch
-        res = safe_chat_completions(
-            client=client,
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=8192,
-            timeout_s=int(timeout_s),
-            retries=6,
-        )
-        if res.error_message:
-            raise TranslateCallError(res.error_message, raw=None)
-        out_parts.append((res.text or "").strip())
+        ch2, ph_map = apply_glossary_placeholders(ch, glossary_map or {})
+        prompt = base_prompt + "\n\n" + ch2
+
+        if enable_qa_retry:
+            text = llm_translate_with_qa(
+                client=client,
+                model=model,
+                prompt=prompt,
+                timeout_s=int(timeout_s),
+                base_retries=6,
+                qa_retries=int(qa_retries),
+                dst_lang=dst_lang,
+            )
+        else:
+            res = safe_chat_completions(
+                client=client,
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=8192,
+                timeout_s=int(timeout_s),
+                retries=6,
+            )
+            if res.error_message:
+                raise TranslateCallError(res.error_message, raw=None)
+            text = (res.text or "").strip()
+
+        text = restore_glossary_placeholders(text, ph_map)
+        out_parts.append(text.strip())
 
     md = mp.normalize_md("\n\n".join([p for p in out_parts if p.strip()]))
 
@@ -901,15 +1042,72 @@ def ocr_image_to_markdown(
 # ============================================================
 # 4.5) PDF -> images (PyMuPDF)
 # ============================================================
-def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = None) -> List[Image.Image]:
+def parse_page_range(spec: str, *, max_pages: Optional[int] = None) -> Optional[List[int]]:
+    """Parse human page range like '1-3,5,8-10' into 0-based page indices.
+    Returns None if spec is empty/invalid (meaning: use default behavior).
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip()
+    if not s:
+        return None
+    s = s.replace("，", ",").replace(" ", "")
+    out: List[int] = []
+    for part in s.split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            if not a.isdigit() or not b.isdigit():
+                return None
+            lo, hi = int(a), int(b)
+            if lo <= 0 or hi <= 0:
+                return None
+            if lo > hi:
+                lo, hi = hi, lo
+            for p in range(lo, hi + 1):
+                out.append(p - 1)
+        else:
+            if not part.isdigit():
+                return None
+            p = int(part)
+            if p <= 0:
+                return None
+            out.append(p - 1)
+    # de-dup and clamp
+    out = sorted(set(out))
+    if max_pages is not None:
+        out = [p for p in out if 0 <= p < max_pages]
+    return out if out else None
+
+
+# ============================================================
+# 4.5) PDF -> images (PyMuPDF)
+# ============================================================
+def pdf_bytes_to_images(
+    pdf_bytes: bytes,
+    dpi: int = 300,
+    max_pages: Optional[int] = None,
+    page_indices: Optional[List[int]] = None,
+) -> List[Image.Image]:
+    """Render PDF pages to PIL Images.
+    - If page_indices is provided (0-based), only render those pages.
+    - Else render first N pages (N=max_pages or all).
+    """
     if not HAVE_PYMUPDF:
         raise RuntimeError("缺少依赖 pymupdf。请先 pip install pymupdf")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     imgs: List[Image.Image] = []
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
-    n = doc.page_count if max_pages is None else min(doc.page_count, max_pages)
-    for i in range(n):
+
+    if page_indices:
+        indices = [i for i in page_indices if 0 <= i < doc.page_count]
+    else:
+        n = doc.page_count if max_pages is None else min(doc.page_count, max_pages)
+        indices = list(range(n))
+
+    for i in indices:
         page = doc.load_page(i)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
@@ -1975,6 +2173,16 @@ with st.sidebar:
     st.caption(f"Base URL: {get_ark_base_url()}")
 
     st.divider()
+
+    with st.expander("术语表/一致性 & 译后质量检查（自动重试）", expanded=False):
+        st.checkbox("启用译后质量检查（自动重试）", key="qa_enable", value=True)
+        st.slider("自动重试次数（仅在检测到问题时）", min_value=0, max_value=5, value=2, step=1, key="qa_retries")
+        st.text_area(
+            "术语表（每行：源语 => 译语 / 源语\t译语 / 源语->译语）",
+            key="glossary_text",
+            height=160,
+            help="用于保证术语一致性：翻译时会把源术语替换为占位符，译后再回填为指定译语。",
+        )
     st.subheader("OCR 参数与自动推荐")
 
     st.selectbox("预设", ["Fast", "Balanced", "Accurate"], key="preset_mode",
@@ -2037,6 +2245,7 @@ with tabs[0]:
         pdf_dpi = st.selectbox("PDF 渲染 DPI", [200, 300, 400], index=1)
     with col_pdf[1]:
         pdf_max_pages = st.number_input("PDF 最多页数（0=不限制）", min_value=0, max_value=500, value=0, step=1)
+        pdf_page_range = st.text_input("PDF 页范围（可选）", value="", help="例如 1-3,5,8-10；留空=按‘最多页数’或全文")
     with col_pdf[2]:
         if not HAVE_PYMUPDF:
             st.warning("未检测到 pymupdf，PDF 上传不可用。请 pip install pymupdf")
@@ -2059,6 +2268,7 @@ with tabs[0]:
                         pdf_bytes,
                         dpi=int(pdf_dpi),
                         max_pages=None if int(pdf_max_pages) == 0 else int(pdf_max_pages),
+                        page_indices=parse_page_range(pdf_page_range),
                     )
                 except Exception as e:
                     st.error(f"PDF 渲染失败：{e}")
