@@ -1270,7 +1270,6 @@ def pandoc_md_to_docx(md: str) -> bytes:
 
 
 # ============================================================
-# ============================================================
 # 7.5) Pandoc math normalization helpers (for thesis-friendly editing)
 # ============================================================
 PANDOC_DISPLAY_MATH_BRACKET_RE = re.compile(r"(?s)\\\[(.+?)\\\]")  # \[ ... \]
@@ -1286,8 +1285,16 @@ def normalize_pandoc_math(
 ) -> str:
     """Normalize math delimiters produced by pandoc for easier paper editing.
 
-    - Pandoc LaTeX writer commonly emits inline math as \(..\) and display math as \[..\].
+    - Pandoc LaTeX writer commonly emits inline math as \(...\) and display math as \[...\].
     - Some sources may already contain $$...$$. We normalize both.
+    - display_style:
+        - equation  : \begin{equation} ... \end{equation} (numbered)
+        - equation* : \begin{equation*} ... \end{equation*} (unnumbered)
+        - bracket   : \[ ... \]
+        - dollars   : $$ ... $$
+    - inline_style:
+        - paren     : \( ... \)
+        - dollars   : $ ... $
     """
     if not text:
         return text
@@ -1307,6 +1314,7 @@ def normalize_pandoc_math(
             return _to_equation(body, starred=True)
         if display_style == "dollars":
             return f"$$\n{body}\n$$"
+        # bracket
         return f"\\[\n{body}\n\\]"
 
     # Normalize display math first (both \[\] and $$ $$)
@@ -1322,39 +1330,11 @@ def normalize_pandoc_math(
     # Normalize inline math (both \(\) and $ $)
     t = PANDOC_INLINE_MATH_PAREN_RE.sub(_inline_repl, t)
     t = PANDOC_INLINE_MATH_DOLLAR_RE.sub(lambda m: _inline_repl(m), t)
+
     return t
 
 
-# ---- Optional: improve Word OMML visual fidelity for "text-like" subscripts/superscripts ----
-# Example: P_seed  -> P_{\mathrm{seed}}
-MATH_DOLLAR_BLOCK_RE = re.compile(r"(?s)\$\$(.+?)\$\$")
-MATH_DOLLAR_INLINE_RE = re.compile(r"(?s)(?<!\$)\$([^$\n]+)\$(?!\$)")
-SUBSUP_TEXT_RE = re.compile(r"([_^])([A-Za-z]{2,})\b")
-
-def _fix_subsup_text_style_in_math(expr: str) -> str:
-    def repl(m):
-        op = m.group(1)  # _ or ^
-        word = m.group(2)
-        return f"{op}{{\\mathrm{{{word}}}}}"
-    return SUBSUP_TEXT_RE.sub(repl, expr)
-
-def normalize_math_text_style(md: str) -> str:
-    """Heuristic: inside $...$/$$...$$ convert bare multi-letter subscripts/superscripts to \mathrm{...}."""
-    if not md:
-        return md
-
-    def fix_block(m):
-        body2 = _fix_subsup_text_style_in_math(m.group(1))
-        return "$$\n" + body2.strip() + "\n$$"
-
-    def fix_inline(m):
-        body2 = _fix_subsup_text_style_in_math(m.group(1))
-        return "$" + body2.strip() + "$"
-
-    md2 = MATH_DOLLAR_BLOCK_RE.sub(fix_block, md)
-    md2 = MATH_DOLLAR_INLINE_RE.sub(fix_inline, md2)
-    return md2
-
+# ============================================================
 # 8) UI: sidebar
 # ============================================================
 ocr_timeout_default, translate_timeout_default = get_timeout_defaults()
@@ -1769,7 +1749,8 @@ with tabs[2]:
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             in_path = td / "in.docx"
-            in_path.write_bytes(docx_file2.read())
+            # ⚠️ 不要用 .read()（会消耗 UploadedFile 的指针，导致后续同一文件无法复用）
+            in_path.write_bytes(docx_file2.getvalue())
 
             extra_args = []
             if wrap_none:
@@ -1813,3 +1794,27 @@ with tabs[2]:
                 st.code(out_text[:4000] + ("\n...\n" if len(out_text) > 4000 else ""), language="markdown")
                 st.download_button("下载 .md", data=out_text.encode("utf-8"), file_name="export.md")
 
+    # ------------------------------------------------------------
+    # ③-补充功能：把文本公式 $...$ / $$...$$ 转回可编辑 Word 公式（OMML）
+    # ------------------------------------------------------------
+    st.divider()
+    st.subheader("把文档中的 .../... 文本公式转为可编辑 Word 公式（OMML）")
+    st.caption(
+        "适用场景：你在 Word 里手打了 $...$（或 $$...$$）占位公式，"
+        "希望一键转成可编辑的原生公式对象（OMML）。实现方式：docx → pandoc markdown → docx（用原文档作为 reference-doc 尽量保留样式）。"
+    )
+
+    if st.button("生成：EditableEquations.docx", disabled=not docx_file2, key="btn_make_omml"):
+        try:
+            raw_bytes = docx_file2.getvalue()
+            out_docx = docx_roundtrip_make_equations_editable(raw_bytes)
+            st.success("已生成，可下载。")
+            st.download_button(
+                "下载 EditableEquations.docx",
+                data=out_docx,
+                file_name="EditableEquations.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_make_omml",
+            )
+        except Exception as e:
+            st.error(f"生成失败：{type(e).__name__}: {e}")
