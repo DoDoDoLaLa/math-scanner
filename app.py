@@ -307,6 +307,9 @@ TRANSLATE_PROMPT_TEMPLATE = r"""
 - 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{ }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
 - LaTeX 代码、公式环境（如 \begin{equation}...\end{equation} 或 $...$）不得改动。
 - 不要添加多余字段、不要输出解释、不要 Markdown。
+""".strip()
+
+
 def llm_translate_items_json(
     *,
     client: OpenAI,
@@ -382,8 +385,6 @@ def llm_translate_items_json(
             raise TranslateCallError(f"segments length mismatch for {_id}: {len(out_map[_id])} != {len(segs)}", raw=res.text[:800])
 
     return out_map
-""".strip()
-
 
 # ============================================================
 # 2) Ark config / client / retry / timeout
