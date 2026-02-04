@@ -143,6 +143,140 @@ def _cached_ai_roundtrip(
 
 
 
+
+
+# --- 翻译增强：直接 DOCX -> LLM 输出 Markdown（OCR $$ 风格）---
+# 目标：省去“先用 Pandoc 抽 Markdown 再翻译”的步骤。我们把 docx 正文按段落抽取成纯文本，
+# 并把 Word 原生公式（OMML）以内嵌占位形式交给 LLM 转成 LaTeX（$...$ / $$...$$），然后再用 Pandoc 写回 Word(OMML)。
+def _iter_paragraph_children_xml(p: Paragraph) -> List[str]:
+    """Return paragraph content as a linear list of chunks, preserving the order of text runs and OMML nodes."""
+    chunks: List[str] = []
+    for child in list(p._p):
+        # Word text run
+        if child.tag.endswith("}r"):
+            # collect all <w:t> under this run
+            ts = child.findall(".//" + qn("w:t"))
+            if ts:
+                chunks.append("".join([(t.text or "") for t in ts]))
+        # OMML math nodes (m:oMath / m:oMathPara)
+        elif child.tag.endswith("}oMath") or child.tag.endswith("}oMathPara"):
+            chunks.append({"__OMML__": child.xml, "__TAG__": child.tag}.get("__OMML__", child.xml))
+        else:
+            # ignore other nodes (bookmarks, etc.)
+            pass
+    return chunks
+
+def _linearize_docx_with_omml_markers(docx_bytes: bytes) -> Tuple[str, int]:
+    """DOCX bytes -> linearized text with OMML markers embedded. Returns (text, eq_count)."""
+    doc = Document(io.BytesIO(docx_bytes))
+    paras = iter_all_paragraphs_extended(doc)
+
+    eq_idx = 0
+    out_lines: List[str] = []
+
+    for p in paras:
+        parts = _iter_paragraph_children_xml(p)
+        if not parts:
+            continue
+        buf = []
+        for part in parts:
+            if not part:
+                continue
+            # detect if this chunk is OMML xml (starts with <m:oMath or <m:oMathPara)
+            s = part.strip()
+            if s.startswith("<m:oMathPara") or s.startswith("<m:oMath"):
+                display = 1 if s.startswith("<m:oMathPara") else 0
+                xml_b64 = base64.b64encode(s.encode("utf-8")).decode("utf-8")
+                marker = f"__OMML_EQ_{eq_idx}__{{display={display},xml_b64={xml_b64}}}__OMML_EQ_{eq_idx}__"
+                buf.append(marker)
+                eq_idx += 1
+            else:
+                buf.append(part)
+        line = "".join(buf)
+        if line.strip():
+            out_lines.append(line)
+
+    # keep paragraph boundaries as blank lines (markdown-ish)
+    return "\n\n".join(out_lines).replace("\r\n", "\n").replace("\r", "\n"), eq_idx
+
+def _chunk_text_for_llm(text: str, max_chars: int) -> List[str]:
+    """Chunk long text by paragraph breaks to keep structure."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    paras = text.split("\n\n")
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    for p in paras:
+        p = p.strip("\n")
+        if not p:
+            continue
+        add = p + "\n\n"
+        if cur and cur_len + len(add) > max_chars:
+            chunks.append("".join(cur).strip())
+            cur, cur_len = [], 0
+        cur.append(add)
+        cur_len += len(add)
+    if cur:
+        chunks.append("".join(cur).strip())
+    return chunks
+
+def _translate_docx_direct_to_markdown_ocr_style(
+    docx_bytes: bytes,
+    *,
+    client: OpenAI,
+    model: str,
+    src_lang: str,
+    dst_lang: str,
+    timeout_s: int,
+    max_batch_chars: int,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    attempt_msg_cb: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Directly translate DOCX content to OCR-style Markdown via LLM (no Pandoc pre-conversion)."""
+    linear, eq_cnt = _linearize_docx_with_omml_markers(docx_bytes)
+    chunks = _chunk_text_for_llm(linear, max_chars=int(max_batch_chars))
+    stats: Dict[str, Any] = {"chunks": len(chunks), "eq_count": int(eq_cnt), "cjk_left": 0}
+
+    if not chunks:
+        return "", stats
+
+    out_parts: List[str] = []
+    total = len(chunks)
+
+    base_prompt = DOCX_TRANSLATE_OCR_STYLE_PROMPT.replace("__SRC_LANG__", src_lang).replace("__DST_LANG__", dst_lang)
+
+    for i, ch in enumerate(chunks, start=1):
+        if progress_cb:
+            progress_cb(i, total)
+        if attempt_msg_cb:
+            attempt_msg_cb(f"直接翻译批次 {i}/{total}（包含 OMML 公式标记，LLM 将转为 $/$$）")
+
+        prompt = base_prompt + "\n\n" + ch
+        res = safe_chat_completions(
+            client=client,
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=8192,
+            timeout_s=int(timeout_s),
+            retries=6,
+        )
+        if res.error_message:
+            raise TranslateCallError(res.error_message, raw=None)
+        out_parts.append((res.text or "").strip())
+
+    md = mp.normalize_md("\n\n".join([p for p in out_parts if p.strip()]))
+
+    # Post-fix: ensure math delimiters are dollars and stable for Pandoc
+    md = mp.sanitize_tex_math_for_pandoc(md)
+    md = mp.normalize_pandoc_math(md, display_style="dollars", inline_style="dollars")
+    md = mp.normalize_md(md)
+
+    if dst_lang in ("English", "en"):
+        stats["cjk_left"] = int(sum(1 for line in md.splitlines() if _has_cjk(line)))
+    return md, stats
 # --- 翻译增强：Pandoc 中转（OCR $$ 风格） ---
 def _split_md_blocks_preserve_spacing(md: str):
     """
@@ -256,15 +390,14 @@ def _cached_pandoc_translate_ocr_route(
     max_batch_chars: int,
 ) -> Tuple[str, bytes, str, Dict[str, Any]]:
     """
-    DOCX -> Pandoc Markdown (OCR $$ style) -> Translate (preserve math) -> Export:
-      - translated markdown
-      - translated docx (Pandoc writes OMML)
-      - translated latex
+    Direct route (no Pandoc pre-conversion):
+      - DOCX -> LLM 直接输出 Markdown（OCR $$ 风格，数学用 $...$ / $$...$$）
+      - Pandoc: Markdown -> DOCX（写回为可编辑 OMML）
+      - Pandoc: Markdown -> LaTeX
     """
-    md = _cached_docx_to_md_for_math(docx_sha, docx_bytes)
     client = get_ark_client(int(timeout_s))
-    md_tr, stats = _translate_markdown_ocr_style(
-        md,
+    md_tr, stats = _translate_docx_direct_to_markdown_ocr_style(
+        docx_bytes,
         client=client,
         model=get_default_model(),
         src_lang=src_lang,
@@ -307,6 +440,32 @@ TRANSLATE_PROMPT_TEMPLATE = r"""
 - 保留所有占位符不变：例如 __MATH_0__、__KEEP_12__、{{ }} 这种标记必须原样输出，不能翻译、不能改大小写、不能删。
 - LaTeX 代码、公式环境（如 \begin{equation}...\end{equation} 或 $...$）不得改动。
 - 不要添加多余字段、不要输出解释、不要 Markdown。
+""".strip()
+
+
+# --- Direct DOCX -> Markdown (OCR $$ style) translation prompt ---
+DOCX_TRANSLATE_OCR_STYLE_PROMPT = r"""
+你是一个严谨的学术翻译与排版引擎。请把我给你的“Word 文档内容抽取文本”从 __SRC_LANG__ 翻译到 __DST_LANG__，
+并直接输出 Markdown，要求尽量模仿本应用 Tab① 的 OCR 输出风格。
+
+输入说明：
+- 我会提供一段“抽取后的正文”，其中夹杂一些公式标记：__OMML_EQ_0__、__OMML_EQ_1__...（对应 Word 原生公式的 OMML XML，已用 base64 编码）。
+- 公式标记会以如下形式出现：
+  __OMML_EQ_k__{display=0|1,xml_b64=...}__OMML_EQ_k__
+  你需要把它替换成 LaTeX 数学公式，并放回原位（行内/行间由 display 决定）。
+
+严格要求：
+1) 只输出 Markdown 正文，不要解释，不要标题，不要 JSON，不要代码块围栏。
+2) 普通文本做学术翻译：语义准确、尽量保留原有结构（换行、列表、标题层级）。
+3) 数学公式必须转换为 LaTeX，并统一分隔符：
+   - 行内公式用 $...$
+   - 行间公式用 $$...$$
+   - 不要输出 \( ... \)、\[ ... \)、\begin{equation}...\end{equation}
+4) 公式内容尽量忠实于 OMML：不要改写变量含义；不要引入新宏包命令；保留可能的编号/标签信息（若能识别）。
+5) 保留占位符/保留字不变：例如 __MATH_0__、__KEEP_12__、{{ }} 之类若出现在正文中，必须原样保留。
+6) 如果目标语言是 English/en：输出中不得出现中文（CJK 字符）。
+
+下面是输入正文（含公式标记）：
 """.strip()
 
 
