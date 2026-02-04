@@ -30,6 +30,17 @@ from docx.oxml.ns import qn
 
 import pypandoc
 
+# ------------------------------------------------------------
+# Lightweight text detectors
+# (Keep near top so any downstream function can safely call.)
+# ------------------------------------------------------------
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _has_cjk(s: str) -> bool:
+    """Return True if string contains any CJK (Chinese/Japanese/Korean) chars."""
+    return bool(_CJK_RE.search(s or ""))
+
 # LaTeX-in-text -> Word equation (OMML) support (optional)
 try:
     from lxml import etree  # type: ignore
@@ -134,143 +145,6 @@ def _cached_ai_roundtrip(
         progress_cb=None,
     )
 
-
-
-
-# --- 翻译增强：Pandoc 中转（OCR $$ 风格） ---
-def _split_md_blocks_preserve_spacing(md: str):
-    """
-    Split markdown into blocks separated by blank lines, but keep the separators so we can re-join
-    without changing layout too much.
-    Returns list of (is_sep, text).
-    """
-    parts = re.split(r"(\n\s*\n+)", md.replace("\r\n", "\n").replace("\r", "\n"))
-    out = []
-    for p in parts:
-        if p is None or p == "":
-            continue
-        if re.fullmatch(r"\n\s*\n+", p):
-            out.append((True, p))
-        else:
-            out.append((False, p))
-    return out
-
-def _translate_markdown_ocr_style(
-    md: str,
-    *,
-    client: OpenAI,
-    model: str,
-    src_lang: str,
-    dst_lang: str,
-    timeout_s: int,
-    max_batch_chars: int,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
-    attempt_msg_cb: Optional[Callable[[str], None]] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    Translate markdown via Ark translate model, while preserving math in $...$/$$...$$.
-    This route is closer to Tab① OCR output: formulas are kept in dollars delimiters,
-    and text is translated block-by-block.
-
-    Returns: (translated_md, stats)
-    """
-    md = mp.normalize_md(md)
-    blocks = _split_md_blocks_preserve_spacing(md)
-
-    items = []
-    refs = []  # (block_idx, mapping)
-    bid = 0
-    for i, (is_sep, text) in enumerate(blocks):
-        if is_sep:
-            continue
-        t = text.strip("\n")
-        if not t.strip():
-            continue
-        protected, mapping = protect_math(t)
-        bid += 1
-        item_id = f"b{bid}"
-        items.append({"id": item_id, "segments": [protected]})
-        refs.append((item_id, i, mapping))
-
-    stats = {"blocks_total": len([1 for is_sep,_ in blocks if not is_sep]), "blocks_translated": len(items), "blocks_untranslated_after": 0}
-
-    if not items:
-        return md, stats
-
-    # batch translate with adaptive split (robust for long docs)
-    batches = chunk_items_for_api(items, max_chars=max_batch_chars)
-    total = len(batches)
-    translated_map_all: Dict[str, List[str]] = {}
-
-    for bi, batch in enumerate(batches, start=1):
-        if progress_cb:
-            progress_cb(bi, total)
-        if attempt_msg_cb:
-            attempt_msg_cb(f"Pandoc 翻译批次 {bi}/{total}：items={len(batch)}")
-
-        translated_map = translate_items_adaptive(
-            client=client,
-            model=model,
-            items=batch,
-            src_lang=src_lang,
-            dst_lang=dst_lang,
-            timeout_s=timeout_s,
-            on_attempt=(lambda a, n, ph: attempt_msg_cb(f"Pandoc 批次 {bi}/{total}：尝试 {a}/{n} · {ph}") if attempt_msg_cb else None),
-            debug_sink=None,
-        )
-        translated_map_all.update(translated_map)
-
-    # write back blocks
-    for item_id, block_idx, mapping in refs:
-        seg = translated_map_all.get(item_id, [""])[0]
-        seg = restore_tokens(seg, mapping)
-        blocks[block_idx] = (False, seg)
-
-    translated_md = mp.normalize_md("".join([t for _, t in blocks]))
-
-    # Stats: count residue CJK when target is English
-    if dst_lang in ("English", "en"):
-        left = sum(1 for _, t in blocks if not _has_cjk(t) is False and _has_cjk(t))
-        stats["blocks_untranslated_after"] = int(left)
-
-    # Always re-sanitize for Pandoc math stability
-    translated_md = mp.sanitize_tex_math_for_pandoc(translated_md)
-    translated_md = mp.normalize_pandoc_math(translated_md, display_style="dollars", inline_style="dollars")
-    translated_md = mp.normalize_md(translated_md)
-    return translated_md, stats
-
-
-@st.cache_data(show_spinner=False, max_entries=16)
-def _cached_pandoc_translate_ocr_route(
-    docx_sha: str,
-    docx_bytes: bytes,
-    src_lang: str,
-    dst_lang: str,
-    timeout_s: int,
-    max_batch_chars: int,
-) -> Tuple[str, bytes, str, Dict[str, Any]]:
-    """
-    DOCX -> Pandoc Markdown (OCR $$ style) -> Translate (preserve math) -> Export:
-      - translated markdown
-      - translated docx (Pandoc writes OMML)
-      - translated latex
-    """
-    md = _cached_docx_to_md_for_math(docx_sha, docx_bytes)
-    client = get_ark_client(int(timeout_s))
-    md_tr, stats = _translate_markdown_ocr_style(
-        md,
-        client=client,
-        model=DEFAULT_TRANSLATE_MODEL,
-        src_lang=src_lang,
-        dst_lang=dst_lang,
-        timeout_s=int(timeout_s),
-        max_batch_chars=int(max_batch_chars),
-        progress_cb=None,
-        attempt_msg_cb=None,
-    )
-    out_docx = mp.pandoc_markdown_to_docx(md_tr, reference_docx_bytes=docx_bytes)
-    latex = mp.pandoc_markdown_to_latex(md_tr)
-    return md_tr, out_docx, latex, stats
 
 
 ensure_pandoc()
@@ -1181,6 +1055,46 @@ def ark_translate_text_via_responses(
     raise TranslateCallError(f"translate failed after retries: {last_err}")
 
 
+
+
+# ---------------------------
+# Translation quality guard (auto-retry when a segment looks "not translated")
+# ---------------------------
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+def _has_cjk(s: str) -> bool:
+    return bool(_CJK_RE.search(s or ""))
+
+def _has_latin(s: str) -> bool:
+    return bool(_LATIN_RE.search(s or ""))
+
+def _looks_untranslated(src: str, out: str, dst_lang: str) -> bool:
+    """Heuristic: if dst is English but output still contains CJK, or
+    dst is Chinese but output still contains lots of Latin letters,
+    treat as not translated and retry with explicit source language."""
+    if not src or not out:
+        return False
+    # exact same (after whitespace) is a strong signal
+    if re.sub(r"\s+", " ", src).strip() == re.sub(r"\s+", " ", out).strip():
+        if dst_lang in ("English", "en"):
+            return _has_cjk(out)
+        if dst_lang in ("Chinese", "zh"):
+            return _has_latin(out)
+    # output still has too much source-language signal
+    if dst_lang in ("English", "en"):
+        return _has_cjk(out)
+    if dst_lang in ("Chinese", "zh"):
+        return _has_latin(out) and not _has_cjk(out)
+    return False
+
+def _force_src_for_retry(src: str, dst_lang: str):
+    if dst_lang in ("English", "en") and _has_cjk(src):
+        return "Chinese"
+    if dst_lang in ("Chinese", "zh") and _has_latin(src) and not _has_cjk(src):
+        return "English"
+    return None
+
 def doubao_translate_items(
     client: OpenAI,
     model: str,
@@ -1235,6 +1149,27 @@ def doubao_translate_items(
             retries=6,
             on_attempt=on_attempt,
         )
+
+        # If the translation API returns the original text (or leaves obvious source-language residue),
+        # retry once with an explicit source language to improve recall on mixed-language segments.
+        if _looks_untranslated(seg, translated, dst_lang):
+            forced_src = _force_src_for_retry(seg, dst_lang)
+            if forced_src and forced_src != src_lang:
+                translated2 = ark_translate_text_via_responses(
+                    api_key=api_key,
+                    base_url=base_url,
+                    text=seg,
+                    src_lang=forced_src,
+                    dst_lang=dst_lang,
+                    timeout_s=timeout_s,
+                    model=translate_model,
+                    retries=6,
+                    on_attempt=on_attempt,
+                )
+                # only accept retry if it improves the target-language signal
+                if not _looks_untranslated(seg, translated2, dst_lang):
+                    translated = translated2
+
         if debug_sink:
             debug_sink(translated[:400])
         return _id, j, translated
@@ -2073,136 +2008,9 @@ with tabs[1]:
 # ---------------------------
 # Tab 3: DOCX -> LaTeX/Markdown export (recommended)
 # ---------------------------
-    st.markdown("---")
-    st.subheader("翻译增强：Pandoc 中转（OCR $$ 风格）→ 可选导出 Markdown / Word(OMML) / LaTeX")
-    st.markdown(
-        '<div class="hint-card">'
-        "这个模式参考 Tab① 的 OCR 输出风格：先用 Pandoc 把 Word 内容抽成 Markdown，并把公式统一为 $...$ / $$...$$；"
-        "再对文本做翻译（公式占位符严格保留），最后可直接导出："
-        "<b>译文 Markdown（OCR 风格）</b>、<b>译文 Word（Pandoc 写回，公式为可编辑 OMML）</b>、<b>译文 LaTeX</b>。"
-        "<br/>适合：你更看重“翻译覆盖率/稳定性”，而不是 100% 保留 Word 原排版。"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    colA, colB, colC = st.columns([2, 1, 1])
-    with colA:
-        upl_docx2 = st.file_uploader("上传 Word 文档（.docx）——Pandoc 中转翻译", type=["docx"], key="tab2_pandoc_translate_docx")
-    with colB:
-        pandoc_max_chars = st.number_input("每批最大字符数（自动分段）", min_value=2000, max_value=20000, value=8000, step=500, key="tab2_pandoc_tr_maxchars")
-    with colC:
-        tr_timeout2 = st.number_input("翻译请求超时（秒）", min_value=30, max_value=600, value=180, step=10, key="tab2_pandoc_tr_timeout")
-
-    do_pandoc_translate = st.button("开始翻译（Pandoc 中转）", type="primary", use_container_width=False, key="btn_tab2_pandoc_translate")
-
-    if do_pandoc_translate:
-        if not upl_docx2:
-            st.warning("请先上传 .docx")
-        elif dst_lang == "Auto":
-            st.warning("目标语言不能是 Auto，请在上方选择目标语言")
-        else:
-            raw_bytes2 = read_uploaded_bytes(upl_docx2)
-            if not raw_bytes2:
-                st.error("读取上传文件失败（空字节）。请重新上传一次。")
-            else:
-                docx_sha2 = mp.sha256_bytes(raw_bytes2)
-
-                prog = st.progress(0.0, text="Pandoc 中转翻译：准备中…")
-                msg = st.empty()
-
-                # 先拿到 md（OCR $$ 风格）——带缓存
-                msg.info("步骤 1/3：DOCX → Pandoc Markdown（统一 $/$$）…")
-                md_ocr = _cached_docx_to_md_for_math(docx_sha2, raw_bytes2)
-
-                # 翻译（用 cache 包起来：同文件同语言不会重复付费）
-                msg.info("步骤 2/3：翻译 Markdown 文本（保留公式占位符）…")
-                try:
-                    md_tr, out_docx_tr, latex_tr, stats = _cached_pandoc_translate_ocr_route(
-                        docx_sha2,
-                        raw_bytes2,
-                        src_lang,
-                        dst_lang,
-                        int(tr_timeout2),
-                        int(pandoc_max_chars),
-                    )
-                except Exception as e:
-                    st.error(f"Pandoc 翻译失败：{type(e).__name__}: {e}")
-                    md_tr = ""
-                    out_docx_tr = b""
-                    latex_tr = ""
-                    stats = {}
-
-                prog.progress(0.85, text="Pandoc 中转翻译：写回/导出…")
-                msg.info("步骤 3/3：导出文件…")
-                prog.progress(1.0, text="完成")
-
-                if md_tr:
-                    st.success(f"完成：blocks={stats.get('blocks_translated')}，残留未翻译块={stats.get('blocks_untranslated_after', 0)}")
-                    st.text_area("译文 Markdown（OCR $$ 风格，可直接编辑/再处理）", md_tr, height=220, key="tab2_md_preview")
-
-                    st.download_button(
-                        "下载：Translated_OCRStyle.md",
-                        data=md_tr.encode("utf-8"),
-                        file_name="Translated_OCRStyle.md",
-                        mime="text/markdown",
-                        use_container_width=False,
-                    )
-                    if latex_tr:
-                        st.download_button(
-                            "下载：Translated.tex",
-                            data=latex_tr.encode("utf-8"),
-                            file_name="Translated.tex",
-                            mime="text/x-tex",
-                            use_container_width=False,
-                        )
-                    if out_docx_tr:
-                        st.download_button(
-                            "下载：Translated_OMML.docx（Pandoc 写回，可编辑公式）",
-                            data=out_docx_tr,
-                            file_name="Translated_OMML.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=False,
-                        )
-
-                    # 可选：把译文 Markdown 送到 Tab③（用于进一步 OMML/AI 校正）
-                    if st.button("把译文 Markdown 填入 Tab③（可继续 OMML / AI 校正）", key="btn_send_to_tab3"):
-                        st.session_state["tab3_seed_markdown"] = md_tr
-                        st.info("已写入 Tab③ 输入框（请切换到 ③ 查看）")
-                else:
-                    st.error("没有生成译文 Markdown（可能翻译失败或内容为空）。")
-
-
 with tabs[2]:
     st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐：可编辑公式最稳）")
     st.write("这个模式不追求保留 Word 排版，而追求“学术 LaTeX 输出正确性”，尤其适合大量可编辑公式。")
-
-    # 你可以在 Tab②（Pandoc 中转翻译）里把译文 Markdown 送到这里进一步导出
-    seed_md = st.session_state.get("tab3_seed_markdown", "")
-    if seed_md:
-        with st.expander("Tab② 传入的译文 Markdown（OCR $$ 风格）→ 直接导出", expanded=False):
-            md_in = st.text_area("Markdown 输入", value=seed_md, height=220, key="tab3_seed_md_area")
-            colx1, colx2 = st.columns(2)
-            with colx1:
-                if st.button("生成 Word（Pandoc 写回，公式 OMML）", key="tab3_seed_to_docx"):
-                    try:
-                        out_docx = mp.pandoc_markdown_to_docx(md_in)
-                        st.download_button(
-                            "下载：SeedTranslated_OMML.docx",
-                            data=out_docx,
-                            file_name="SeedTranslated_OMML.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                    except Exception as e:
-                        st.error(f"生成 DOCX 失败：{type(e).__name__}: {e}")
-            with colx2:
-                if st.button("生成 LaTeX（.tex）", key="tab3_seed_to_tex"):
-                    try:
-                        tex = mp.pandoc_markdown_to_latex(md_in)
-                        st.download_button("下载：SeedTranslated.tex", data=tex.encode("utf-8"), file_name="SeedTranslated.tex", mime="text/x-tex")
-                    except Exception as e:
-                        st.error(f"生成 LaTeX 失败：{type(e).__name__}: {e}")
-
-
 
     docx_file2 = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_export")
 
