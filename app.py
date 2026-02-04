@@ -52,11 +52,11 @@ except Exception:
 st.set_page_config(page_title="Ark OCR / DOCX Translate / LaTeX Export", layout="wide")
 
 st.markdown(
-    \"\"\"<style>
-    .stTabs [data-baseweb=\"tab\"] {font-size: 15px; padding: 10px 14px;}
-    .stTabs [aria-selected=\"true\"] {font-weight: 700;}
+    """<style>
+    .stTabs [data-baseweb="tab"] {font-size: 15px; padding: 10px 14px;}
+    .stTabs [aria-selected="true"] {font-weight: 700;}
     .hint-card {background: #f6f8fa; border: 1px solid #e5e7eb; padding: 12px 14px; border-radius: 10px;}
-    </style>\"\"\",
+    </style>""",
     unsafe_allow_html=True,
 )
 
