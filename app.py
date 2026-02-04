@@ -1268,6 +1268,37 @@ def pandoc_md_to_docx(md: str) -> bytes:
         pypandoc.convert_text(md, to="docx", format=fmt, outputfile=str(out))
         return out.read_bytes()
 
+def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
+    """DOCX -> Pandoc Markdown -> DOCX to convert $...$/$$...$$ text math into native Word equations (OMML).
+
+    Implementation:
+    1) docx -> markdown+tex_math_dollars  (keep TeX delimiters)
+    2) normalize/sanitize markdown (undo escaping that breaks TeX)
+    3) markdown+tex_math_dollars -> docx  (Pandoc emits OMML)
+    We use the original DOCX as --reference-doc to preserve styles as much as possible.
+    """
+    if not docx_bytes:
+        return docx_bytes
+
+    # Step 1-2: get sanitized markdown suitable for Pandoc's TeX math parser
+    md = docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
+    md = normalize_md(md) + "\n"
+
+    # Step 3: write back to DOCX (OMML)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        in_path = td / "in.docx"
+        out_path = td / "out.docx"
+        in_path.write_bytes(docx_bytes)
+        pypandoc.convert_text(
+            md,
+            to="docx",
+            format="markdown+tex_math_dollars",
+            outputfile=str(out_path),
+            extra_args=["--reference-doc", str(in_path)],
+        )
+        return out_path.read_bytes()
+
 # ============================================================
 # 7.7) AI-assisted "DOCX text -> OCR-style math -> OMML" (Tab 3 enhancement)
 # ============================================================
