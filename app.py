@@ -2594,7 +2594,7 @@ with tabs[1]:
         st.session_state["formula_latex_editor"] = ""
 
     latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
-if latex_text.strip():
+    if latex_text.strip():
         preview_expr = latex_text.strip()
         st.markdown("**实时预览**")
         try:
