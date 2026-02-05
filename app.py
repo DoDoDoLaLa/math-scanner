@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -2582,12 +2583,14 @@ with tabs[1]:
                 _ocr_latex = (res.text or "").strip()
                 st.session_state["formula_latex_text"] = _ocr_latex
                 st.session_state["formula_latex_editor"] = _ocr_latex
+                st.session_state["formula_latex_text"] = (res.text or "").strip()
                 st.success("公式识别完成，可在下方继续编辑。")
         except Exception as e:
             st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
     # 关键修复：编辑器使用同一个 key，识别结果直接写入该 key，避免“识别成功但编辑器为空”。
     latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
+    latex_text = st.text_area("LaTeX 编辑器", value=st.session_state.get("formula_latex_text", ""), height=220, key="formula_latex_editor")
     st.session_state["formula_latex_text"] = latex_text
 
     if latex_text.strip():
@@ -3195,6 +3198,94 @@ if len(tabs) > 4:
                     st.error(f"Sample 测试失败：{type(e).__name__}: {e}")
 else:
     st.info("当前运行版本未启用第⑤页（标题格式化），请切到包含该功能的分支/最新提交。")
+with tabs[4]:
+    st.markdown("---")
+    st.subheader("标题格式化（纯程序逻辑，无 AI）")
+    st.caption("上传 .docx 后，按段落样式识别 Heading 1/2/3，并按你配置的字体名/字号/粗体批量写回导出。")
+
+    st.markdown(
+        "**说明（识别规则）**：仅根据段落样式名判断标题级别（如 `Heading 1/2/3`、`标题 1/2/3`），其余视为普通段落。"
+    )
+
+    docx_title_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_title_format")
+
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
+        st.markdown("**一级标题样式**")
+        h1_font = st.text_input("字体名（H1）", value="SimHei", key="h1_font")
+        h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=18.0, step=0.5, key="h1_size")
+        h1_bold = st.checkbox("加粗（H1）", value=True, key="h1_bold")
+    with col_t2:
+        st.markdown("**二级标题样式**")
+        h2_font = st.text_input("字体名（H2）", value="SimHei", key="h2_font")
+        h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h2_size")
+        h2_bold = st.checkbox("加粗（H2）", value=True, key="h2_bold")
+    with col_t3:
+        st.markdown("**三级标题样式**")
+        h3_font = st.text_input("字体名（H3）", value="SimHei", key="h3_font")
+        h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h3_size")
+        h3_bold = st.checkbox("加粗（H3）", value=False, key="h3_bold")
+
+    if st.button("解析文档标题结构", disabled=not docx_title_file, key="btn_analyze_titles"):
+        try:
+            title_doc_bytes = read_uploaded_bytes(docx_title_file)
+            rows = mp.analyze_docx_headings(title_doc_bytes)
+            st.session_state["title_rows"] = rows
+            c1 = sum(1 for r in rows if r.get("level") == 1)
+            c2 = sum(1 for r in rows if r.get("level") == 2)
+            c3 = sum(1 for r in rows if r.get("level") == 3)
+            cn = sum(1 for r in rows if not r.get("level"))
+            st.success(f"解析完成：H1={c1}, H2={c2}, H3={c3}, 普通段落={cn}")
+        except Exception as e:
+            st.error(f"解析失败：{type(e).__name__}: {e}")
+
+    rows = st.session_state.get("title_rows", []) if docx_title_file else []
+    if rows:
+        st.dataframe(rows, use_container_width=True, height=320)
+
+    if st.button("应用样式并导出", type="primary", disabled=not docx_title_file, key="btn_apply_title_style"):
+        try:
+            title_doc_bytes = read_uploaded_bytes(docx_title_file)
+            cfg = {
+                1: {"font_name": h1_font, "size_pt": h1_size, "bold": h1_bold},
+                2: {"font_name": h2_font, "size_pt": h2_size, "bold": h2_bold},
+                3: {"font_name": h3_font, "size_pt": h3_size, "bold": h3_bold},
+            }
+            out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg)
+            st.success("标题样式已应用并生成新文档。")
+            st.download_button(
+                "下载：TitleFormatted.docx",
+                data=out_docx,
+                file_name="TitleFormatted.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_title_formatted",
+            )
+        except Exception as e:
+            st.error(f"导出失败：{type(e).__name__}: {e}")
+
+    with st.expander("模板与样例测试说明", expanded=False):
+        st.markdown(
+            """
+**template.docx 如何构造**
+1. 在 Word 中新建文档。
+2. 为一级/二级/三级标题段落分别使用内置样式：`Heading 1`、`Heading 2`、`Heading 3`（中文界面常显示为“标题 1/2/3”）。
+3. 正文使用 `Normal`（正文）样式。
+4. 保存为 `template.docx` 后上传即可。
+
+**内置 sample 测试用例**
+- 点击下方按钮会在内存中构造一个 4 段文档：H1/H2/H3/正文各一段。
+- 程序会执行“解析 + 应用样式”，并检查计数与粗体设置是否符合预期。
+            """
+        )
+        if st.button("运行内置 sample 测试", key="btn_title_selftest"):
+            try:
+                result = mp.selftest_title_formatting()
+                if result.get("ok"):
+                    st.success(f"Sample 测试通过：{result}")
+                else:
+                    st.error(f"Sample 测试未通过：{result}")
+            except Exception as e:
+                st.error(f"Sample 测试失败：{type(e).__name__}: {e}")
 
 
 def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
