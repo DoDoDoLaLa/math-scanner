@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Callable, Iterable
 
 import streamlit as st
+from streamlit.errors import StreamlitDuplicateElementKey
 
 
 # --- tiny helpers ---
@@ -2589,6 +2590,14 @@ with tabs[1]:
             st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
     # 关键修复：编辑器使用同一个 key，识别结果直接写入该 key，避免“识别成功但编辑器为空”。
+    # 兼容修复：若分支合并导致重复 key，自动回退到备用 key，避免整个页面崩溃。
+    try:
+        latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
+    except StreamlitDuplicateElementKey:
+        st.warning("检测到重复的公式编辑器 key（formula_latex_editor），已自动切换备用编辑器 key。请清理重复代码后再部署。")
+        if "formula_latex_editor_backup" not in st.session_state:
+            st.session_state["formula_latex_editor_backup"] = st.session_state.get("formula_latex_editor", "")
+        latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor_backup")
     latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
     latex_text = st.text_area("LaTeX 编辑器", value=st.session_state.get("formula_latex_text", ""), height=220, key="formula_latex_editor")
     st.session_state["formula_latex_text"] = latex_text
