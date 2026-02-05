@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import pypandoc
+from docx import Document
+from docx.shared import Pt
+from docx.oxml.ns import qn
 
 
 # -----------------------------
