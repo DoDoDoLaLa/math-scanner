@@ -2866,7 +2866,7 @@ with tabs[2]:
 # ---------------------------
 # Tab 3: DOCX -> LaTeX/Markdown export (recommended)
 # ---------------------------
-with tabs[2]:
+with tabs[3]:
     st.markdown("---")
     st.subheader("Word(.docx) → LaTeX / Markdown 直接导出（推荐：可编辑公式最稳）")
     st.write("这个模式不追求保留 Word 排版，而追求“学术 LaTeX 输出正确性”，尤其适合大量可编辑公式。")
