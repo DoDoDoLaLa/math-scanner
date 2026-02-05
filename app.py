@@ -24,6 +24,25 @@ def _has_cjk(s: str) -> bool:
 
 # --- Academic features: glossary + post-translation QA (auto-retry) ---
 GLOSS_PLACEHOLDER_RE = re.compile(r"__GLOSS\d+__")
+def _is_ascii_alnum_term(s: str) -> bool:
+    t = (s or "").strip()
+    return bool(t) and bool(re.fullmatch(r"[A-Za-z0-9]+", t))
+
+
+def _is_cjk_term(s: str) -> bool:
+    return bool(re.search(r"[一-鿿]", s or ""))
+
+
+def _compile_glossary_pattern(src: str, *, allow_substring_match: bool) -> re.Pattern:
+    esc = re.escape(src)
+    if allow_substring_match:
+        return re.compile(esc)
+    if _is_ascii_alnum_term(src):
+        return re.compile(rf"\b{esc}\b")
+    if _is_cjk_term(src):
+        return re.compile(esc)
+    # Mixed/symbol term (e.g., machine learning, p-value): non-word boundaries via lookaround.
+    return re.compile(rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])")
 
 def parse_glossary_mapping(text: str) -> Dict[str, str]:
     """Parse glossary lines into dict.
@@ -54,23 +73,63 @@ def parse_glossary_mapping(text: str) -> Dict[str, str]:
         mapping[parts[0]] = parts[1]
     return mapping
 
-def apply_glossary_placeholders(text: str, glossary: Dict[str, str]) -> Tuple[str, Dict[str, str]]:
-    """Replace glossary source terms with stable placeholders so the model keeps them unchanged,
-    then we restore them to the desired target terms after translation.
-    Returns (text_with_placeholders, placeholder_to_target).
+def apply_glossary_placeholders(
+    text: str,
+    glossary: Dict[str, str],
+    *,
+    allow_substring_match: bool = False,
+) -> Tuple[str, Dict[str, str]]:
+    """Replace glossary source terms with stable placeholders in one regex pass.
+
+    Safety goals:
+    - no destructive substring pollution (cat -> catastrophe, AI -> PAIN)
+    - longest-first matching on overlaps
+    - no nested / repeated placeholder replacement
     """
     if not text or not glossary:
         return text, {}
-    # Longest-first to avoid partial overlaps.
-    items = sorted(glossary.items(), key=lambda kv: len(kv[0]), reverse=True)
+
+    entries = [(src, tgt) for src, tgt in glossary.items() if (src or "").strip()]
+    if not entries:
+        return text, {}
+
+    # Longest-first for overlap stability. Keep insertion order as secondary key.
+    entries = sorted(entries, key=lambda kv: len(kv[0]), reverse=True)
+
+    patterns: List[Tuple[re.Pattern, str, str, str]] = []
     placeholder_to_target: Dict[str, str] = {}
-    out = text
-    for i, (src, tgt) in enumerate(items):
+    for i, (src, tgt) in enumerate(entries):
         ph = f"__GLOSS{i}__"
-        if src in out:
-            out = out.replace(src, ph)
-            placeholder_to_target[ph] = tgt
-    return out, placeholder_to_target
+        patterns.append((_compile_glossary_pattern(src, allow_substring_match=allow_substring_match), src, ph, tgt))
+
+    occupied = [False] * len(text)
+    selected: List[Tuple[int, int, str, str]] = []  # (start, end, placeholder, target)
+    for patt, _src, ph, tgt in patterns:
+        for m in patt.finditer(text):
+            a, b = m.span()
+            if a >= b:
+                continue
+            if any(occupied[a:b]):
+                continue
+            selected.append((a, b, ph, tgt))
+            for k in range(a, b):
+                occupied[k] = True
+
+    if not selected:
+        return text, {}
+
+    selected.sort(key=lambda x: x[0])
+    out_parts: List[str] = []
+    cur = 0
+    for a, b, ph, tgt in selected:
+        if a < cur:
+            continue
+        out_parts.append(text[cur:a])
+        out_parts.append(ph)
+        placeholder_to_target[ph] = tgt
+        cur = b
+    out_parts.append(text[cur:])
+    return "".join(out_parts), placeholder_to_target
 
 def restore_glossary_placeholders(text: str, placeholder_to_target: Dict[str, str]) -> str:
     if not text or not placeholder_to_target:
@@ -354,6 +413,7 @@ def _translate_docx_direct_to_markdown_ocr_style(
     timeout_s: int,
     max_batch_chars: int,
     glossary_map: Optional[Dict[str, str]] = None,
+    glossary_allow_substring: bool = False,
     enable_qa_retry: bool = True,
     qa_retries: int = 2,
     progress_cb: Optional[Callable[[int, int], None]] = None,
@@ -378,7 +438,11 @@ def _translate_docx_direct_to_markdown_ocr_style(
         if attempt_msg_cb:
             attempt_msg_cb(f"直接翻译批次 {i}/{total}（包含 OMML 公式标记，LLM 将转为 $/$$）")
 
-        ch2, ph_map = apply_glossary_placeholders(ch, glossary_map or {})
+        ch2, ph_map = apply_glossary_placeholders(
+            ch,
+            glossary_map or {},
+            allow_substring_match=bool(glossary_allow_substring),
+        )
         prompt = base_prompt + "\n\n" + ch2
 
         if enable_qa_retry:
@@ -529,6 +593,8 @@ def _cached_pandoc_translate_ocr_route(
     dst_lang: str,
     timeout_s: int,
     max_batch_chars: int,
+    glossary_text: str = "",
+    glossary_allow_substring: bool = False,
 ) -> Tuple[str, bytes, str, Dict[str, Any]]:
     """
     Direct route (no Pandoc pre-conversion):
@@ -545,8 +611,10 @@ def _cached_pandoc_translate_ocr_route(
         dst_lang=dst_lang,
         timeout_s=int(timeout_s),
         max_batch_chars=int(max_batch_chars),
+        glossary_map=parse_glossary_mapping(glossary_text),
         progress_cb=None,
         attempt_msg_cb=None,
+        glossary_allow_substring=bool(glossary_allow_substring),
     )
     out_docx = mp.pandoc_markdown_to_docx(md_tr, reference_docx_bytes=docx_bytes)
     latex = mp.pandoc_markdown_to_latex(md_tr)
@@ -608,6 +676,84 @@ DOCX_TRANSLATE_OCR_STYLE_PROMPT = r"""
 
 下面是输入正文（含公式标记）：
 """.strip()
+
+
+FORMULA_OCR_TO_LATEX_PROMPT_ZH = r"""
+你是数学公式 OCR 转写器。请只输出该图片中最核心公式对应的 LaTeX 代码，要求：
+1) 只输出 LaTeX 公式文本，不要解释，不要代码块围栏。
+2) 不要添加额外自然语言。
+3) 默认输出可用于行间公式的主体（不强制包含 $$）。
+4) 若有多个公式，按从上到下拼接，使用 \\ 分行。
+""".strip()
+
+SMART_GLOSSARY_EXTRACT_PROMPT_ZH = r"""
+你是学术翻译术语抽取助手。请从给定文本中提取翻译时应保持一致的术语候选。
+
+输出必须是 JSON 对象，格式：
+{
+  "items": [
+    {"src":"", "suggested":"", "type":"term|person|place", "freq_estimate":1, "note":""}
+  ]
+}
+
+规则：
+1) 仅输出最重要 top-K 候选，避免常见普通词。
+2) src 为原文术语，suggested 为建议译法（可与 src 相同），type 只能是 term/person/place。
+3) freq_estimate 给出 1-100 的粗略频次估计。
+4) note 可用于提示大小写、复数、词形变体（例如 AI/AIs, model/models）。
+5) 只输出 JSON，不要解释。
+""".strip()
+
+
+def smart_extract_glossary_candidates(
+    *,
+    client: OpenAI,
+    model: str,
+    preview_text: str,
+    src_lang: str,
+    dst_lang: str,
+    top_k: int,
+    timeout_s: int,
+) -> List[Dict[str, Any]]:
+    if not preview_text.strip():
+        return []
+    prompt = (
+        SMART_GLOSSARY_EXTRACT_PROMPT_ZH
+        + f"\n\n源语言: {src_lang}\n目标语言: {dst_lang}\nTop-K: {int(top_k)}\n"
+        + "\n文本如下：\n"
+        + preview_text
+    )
+    res = safe_chat_completions(
+        client=client,
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=4096,
+        timeout_s=int(timeout_s),
+        retries=6,
+        response_format={"type": "json_object"},
+    )
+    if res.error_message:
+        raise TranslateCallError(res.error_message, raw=None)
+    obj = extract_json_object(res.text)
+    items = obj.get("items") if isinstance(obj, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        src = str(it.get("src", "")).strip()
+        if not src:
+            continue
+        out.append({
+            "src": src,
+            "suggested": str(it.get("suggested", "")).strip(),
+            "type": str(it.get("type", "term")).strip() or "term",
+            "freq_estimate": int(it.get("freq_estimate", 1) or 1),
+            "note": str(it.get("note", "")).strip(),
+        })
+    return out[: int(top_k)]
 
 
 def llm_translate_items_json(
@@ -2150,6 +2296,12 @@ def _init_state():
         "ocr_timeout_s": int(ocr_timeout_default),
         "translate_timeout_s": int(translate_timeout_default),
         "preset_mode": "Balanced",
+        "glossary_allow_substring": False,
+        "smart_glossary_top_k": 20,
+        "smart_glossary_preview_chars": 9000,
+        "smart_glossary_candidates": [],
+        "formula_latex_text": "",
+        "formula_display_mode": "行间（$$...$$）",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2183,6 +2335,13 @@ with st.sidebar:
             height=160,
             help="用于保证术语一致性：翻译时会把源术语替换为占位符，译后再回填为指定译语。",
         )
+        st.checkbox(
+            "术语允许子串匹配（默认关闭，建议仅在明确需要时开启）",
+            key="glossary_allow_substring",
+            value=False,
+            help="关闭时：英文/数字术语按词边界匹配，符号术语按前后非字母数字边界匹配，中文走最长优先匹配。",
+        )
+        st.caption("提示：默认关闭可避免 cat→catastrophe、AI→PAIN 这类污染替换。")
     st.subheader("OCR 参数与自动推荐")
 
     st.selectbox("预设", ["Fast", "Balanced", "Accurate"], key="preset_mode",
@@ -2220,8 +2379,9 @@ with st.sidebar:
 # ============================================================
 tabs = st.tabs([
     "① PDF/图片 OCR → 导出",
-    "② Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
-    "③ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
+    "② 公式 OCR → LaTeX（沉浸编辑）",
+    "③ Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
+    "④ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
 ])
 
 # ---------------------------
@@ -2374,9 +2534,79 @@ with tabs[0]:
 
 
 # ---------------------------
-# Tab 2: DOCX translate + best-effort equation replace
+# Tab 2: Formula OCR -> LaTeX immersive editor
 # ---------------------------
 with tabs[1]:
+    st.subheader("公式 OCR → LaTeX（可编辑 + 实时预览）")
+    st.caption("上传公式截图，自动转 LaTeX；可手动编辑并实时预览，支持复制。")
+
+    formula_file = st.file_uploader("上传公式图片", type=["png", "jpg", "jpeg", "webp"], key="formula_ocr_img")
+    cfm1, cfm2, cfm3 = st.columns([1, 1, 2])
+    with cfm1:
+        formula_out_tokens = st.slider("公式 OCR max tokens", 256, 4096, 1024, 128, key="formula_ocr_tokens")
+    with cfm2:
+        st.selectbox("预览模式", ["行间（$$...$$）", "行内（$...$）"], key="formula_display_mode")
+    with cfm3:
+        run_formula_ocr = st.button("识别公式并填入编辑器", type="primary", disabled=not formula_file, key="btn_formula_ocr")
+
+    if run_formula_ocr and formula_file:
+        try:
+            client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
+            img = Image.open(io.BytesIO(read_uploaded_bytes(formula_file))).convert("RGB")
+            data_url = _jpeg_bytes_to_data_url(pil_to_jpeg_bytes(img, quality=int(st.session_state.get("jpeg_q", 90))))
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": FORMULA_OCR_TO_LATEX_PROMPT_ZH},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }]
+            res = safe_chat_completions(
+                client=client,
+                model=st.session_state.get("ocr_model_id", "").strip() or get_default_model(),
+                messages=messages,
+                temperature=0.0,
+                max_tokens=int(formula_out_tokens),
+                timeout_s=int(st.session_state["ocr_timeout_s"]),
+                retries=6,
+            )
+            if res.error_message:
+                st.error(f"公式 OCR 失败：{res.error_message}")
+            else:
+                st.session_state["formula_latex_text"] = (res.text or "").strip()
+                st.success("公式识别完成，可在下方继续编辑。")
+        except Exception as e:
+            st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
+
+    latex_text = st.text_area("LaTeX 编辑器", value=st.session_state.get("formula_latex_text", ""), height=220, key="formula_latex_editor")
+    st.session_state["formula_latex_text"] = latex_text
+
+    if latex_text.strip():
+        preview_expr = latex_text.strip()
+        st.markdown("**实时预览**")
+        try:
+            if st.session_state.get("formula_display_mode") == "行内（$...$）":
+                st.markdown(f"预览：${preview_expr}$")
+            else:
+                st.latex(preview_expr)
+        except Exception as e:
+            st.warning(f"预览渲染失败：{type(e).__name__}: {e}")
+
+    wrapped = f"${latex_text.strip()}$" if st.session_state.get("formula_display_mode") == "行内（$...$）" else f"$$\n{latex_text.strip()}\n$$"
+    st.code(wrapped if latex_text.strip() else "", language="latex")
+    st.download_button(
+        "下载 LaTeX 文本（.txt）",
+        data=(wrapped if latex_text.strip() else "").encode("utf-8"),
+        file_name="formula_latex.txt",
+        mime="text/plain",
+        key="dl_formula_latex_txt",
+    )
+
+
+# ---------------------------
+# Tab 3: DOCX translate + best-effort equation replace
+# ---------------------------
+with tabs[2]:
     st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
     st.warning(
         "说明：Word 可编辑公式（OMML）要“可靠”转 LaTeX，推荐使用 Tab③ 的 Pandoc 直接导出。\n"
@@ -2424,6 +2654,65 @@ with tabs[1]:
     enable_pandoc_translate = st.checkbox("启用 Pandoc 中转翻译（更稳，推荐）", value=True, key="pandoc_translate_enable")
     max_batch_chars2 = st.number_input("每批最大字符数（自动分段）", min_value=2000, max_value=20000, value=8000, step=500, key="pandoc_translate_max_chars")
 
+    with st.expander("智能术语提取（Smart Glossary Extraction）", expanded=False):
+        st.caption("翻译前可先预扫描文档前部内容，自动提取 top-K 术语候选，勾选后写入术语表。")
+        csg1, csg2 = st.columns(2)
+        with csg1:
+            st.number_input("预扫描字符数", min_value=2000, max_value=30000, step=500, key="smart_glossary_preview_chars")
+        with csg2:
+            st.number_input("候选数量 Top-K", min_value=5, max_value=100, step=1, key="smart_glossary_top_k")
+
+        if st.button("预扫描并提取术语候选", disabled=not docx_file, key="btn_smart_glossary_scan"):
+            try:
+                doc_preview_bytes = read_uploaded_bytes(docx_file)
+                preview_text = mp.extract_docx_preview_text_for_glossary(
+                    doc_preview_bytes,
+                    max_chars=int(st.session_state.get("smart_glossary_preview_chars", 9000)),
+                )
+                client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
+                candidates = smart_extract_glossary_candidates(
+                    client=client,
+                    model=st.session_state.get("translate_model_id", "").strip() or DEFAULT_TRANSLATE_MODEL,
+                    preview_text=preview_text,
+                    src_lang=src_lang,
+                    dst_lang=dst_lang,
+                    top_k=int(st.session_state.get("smart_glossary_top_k", 20)),
+                    timeout_s=int(st.session_state["translate_timeout_s"]),
+                )
+                st.session_state["smart_glossary_candidates"] = candidates
+                st.success(f"已生成术语候选：{len(candidates)} 条")
+            except Exception as e:
+                st.error(f"术语提取失败：{type(e).__name__}: {e}")
+
+        candidates = st.session_state.get("smart_glossary_candidates", []) or []
+        if candidates:
+            st.markdown("**候选（可勾选后写入术语表）**")
+            for idx, it in enumerate(candidates):
+                src_v = it.get("src", "")
+                sug_v = it.get("suggested", "")
+                type_v = it.get("type", "term")
+                freq_v = it.get("freq_estimate", 1)
+                note_v = it.get("note", "")
+                cols = st.columns([1, 3, 3, 1, 3])
+                checked = cols[0].checkbox("选", key=f"sg_pick_{idx}", value=True)
+                src_edit = cols[1].text_input("src", value=src_v, key=f"sg_src_{idx}")
+                sug_edit = cols[2].text_input("suggested", value=sug_v, key=f"sg_sug_{idx}")
+                cols[3].write(f"{type_v}/{freq_v}")
+                cols[4].caption(note_v or "-")
+                it["_picked"] = bool(checked)
+                it["src"] = src_edit.strip()
+                it["suggested"] = sug_edit.strip()
+
+            if st.button("将已勾选候选写入术语表", key="btn_apply_smart_glossary"):
+                picked_lines: List[str] = []
+                for it in candidates:
+                    if it.get("_picked") and it.get("src") and it.get("suggested"):
+                        picked_lines.append(f"{it['src']} => {it['suggested']}")
+                merged = (st.session_state.get("glossary_text", "") or "").strip()
+                addon = "\n".join(picked_lines).strip()
+                st.session_state["glossary_text"] = (merged + "\n" + addon).strip() if merged and addon else (merged or addon)
+                st.success(f"已写入术语表：{len(picked_lines)} 条。提示：英文术语建议同时补充大小写/复数变体。")
+
     if st.button("开始翻译（Pandoc 中转）", type="primary", disabled=(not docx_file) or (not enable_pandoc_translate), key="btn_pandoc_translate"):
         try:
             doc_bytes2 = read_uploaded_bytes(docx_file)
@@ -2436,6 +2725,8 @@ with tabs[1]:
                     dst_lang=dst_lang,
                     timeout_s=int(st.session_state["translate_timeout_s"]),
                     max_batch_chars=int(max_batch_chars2),
+                    glossary_text=st.session_state.get("glossary_text", ""),
+                    glossary_allow_substring=bool(st.session_state.get("glossary_allow_substring", False)),
                 )
 
             st.success("Pandoc 翻译完成")
