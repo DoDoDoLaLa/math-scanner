@@ -2303,7 +2303,6 @@ def _init_state():
         "smart_glossary_preview_chars": 9000,
         "smart_glossary_candidates": [],
         "formula_latex_text": "",
-        "formula_latex_editor": "",
         "formula_display_mode": "行间（$$...$$）",
     }
     for k, v in defaults.items():
@@ -2385,7 +2384,6 @@ tabs = st.tabs([
     "② 公式 OCR → LaTeX（沉浸编辑）",
     "③ Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
     "④ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
-    "⑤ 标题格式化",
 ])
 
 # ---------------------------
@@ -2577,15 +2575,12 @@ with tabs[1]:
             if res.error_message:
                 st.error(f"公式 OCR 失败：{res.error_message}")
             else:
-                _ocr_latex = (res.text or "").strip()
-                st.session_state["formula_latex_text"] = _ocr_latex
-                st.session_state["formula_latex_editor"] = _ocr_latex
+                st.session_state["formula_latex_text"] = (res.text or "").strip()
                 st.success("公式识别完成，可在下方继续编辑。")
         except Exception as e:
             st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
-    # 关键修复：编辑器使用同一个 key，识别结果直接写入该 key，避免“识别成功但编辑器为空”。
-    latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
+    latex_text = st.text_area("LaTeX 编辑器", value=st.session_state.get("formula_latex_text", ""), height=220, key="formula_latex_editor")
     st.session_state["formula_latex_text"] = latex_text
 
     if latex_text.strip():
@@ -3190,6 +3185,7 @@ with tabs[4]:
                     st.error(f"Sample 测试未通过：{result}")
             except Exception as e:
                 st.error(f"Sample 测试失败：{type(e).__name__}: {e}")
+
 
 def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
     sha = mp.sha256_bytes(docx_bytes)
