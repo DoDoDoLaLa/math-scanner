@@ -2303,6 +2303,7 @@ def _init_state():
         "smart_glossary_top_k": 20,
         "smart_glossary_preview_chars": 9000,
         "smart_glossary_candidates": [],
+        # MERGE NOTE: keep all 3 keys below (text/editor/display) when resolving branch conflicts.
         "formula_latex_text": "",
         "formula_latex_editor": "",
         "formula_display_mode": "行间（$$...$$）",
@@ -2381,6 +2382,7 @@ with st.sidebar:
 # ============================================================
 # 9) Tabs
 # ============================================================
+# MERGE NOTE: keep Tab⑤ label and corresponding with tabs[4] block together during conflict resolution.
 tabs = st.tabs([
     "① PDF/图片 OCR → 导出",
     "② 公式 OCR → LaTeX（沉浸编辑）",
