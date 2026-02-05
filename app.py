@@ -2324,6 +2324,7 @@ with st.sidebar:
     st.subheader("Ark 配置")
     st.text_input("OCR model（默认 EP 已填）", key="ocr_model_id")
     st.text_input("Translate model（翻译专用 EP）", key="translate_model_id")
+    st.text_input("Glossary model（术语提取用，可留空=使用 OCR/Chat 模型）", key="glossary_model_id")
     st.text_input("MML2OMML.XSL 路径（可选：仅用于把 $...$ 转 Word 公式）", key="mml2omml_xsl")
     st.caption(f"Base URL: {get_ark_base_url()}")
 
@@ -2553,58 +2554,57 @@ with tabs[1]:
         st.selectbox("预览模式", ["行间（$$...$$）", "行内（$...$）"], key="formula_display_mode")
     with cfm3:
         run_formula_ocr = st.button("识别公式并填入编辑器", type="primary", disabled=not formula_file, key="btn_formula_ocr")
-if run_formula_ocr and formula_file:
-    try:
-        client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
-        img = Image.open(io.BytesIO(read_uploaded_bytes(formula_file))).convert("RGB")
-        data_url = _jpeg_bytes_to_data_url(pil_to_jpeg_bytes(img, quality=int(st.session_state.get("jpeg_q", 90))))
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": FORMULA_OCR_TO_LATEX_PROMPT_ZH},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }]
-        res = safe_chat_completions(
-            client=client,
-            model=st.session_state.get("ocr_model_id", "").strip() or get_default_model(),
-            messages=messages,
-            temperature=0.0,
-            max_tokens=int(formula_out_tokens),
-            timeout_s=int(st.session_state["ocr_timeout_s"]),
-            retries=6,
-        )
-        if res.error_message:
-            st.error(f"公式 OCR 失败：{res.error_message}")
-        else:
-            _ocr_latex = (res.text or "").strip()
-            # ✅ 正确做法：只维护一个编辑器 key；不要在 widget 创建后再写回同名 key
-            st.session_state["formula_latex_text"] = _ocr_latex
-            st.session_state["formula_latex_editor"] = _ocr_latex  # 这里在 text_area 渲染前写入，合法
-            st.success("公式识别完成，可在下方继续编辑。")
-    except Exception as e:
-        st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
+    if run_formula_ocr and formula_file:
+        try:
+            client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
+            img = Image.open(io.BytesIO(read_uploaded_bytes(formula_file))).convert("RGB")
+            data_url = _jpeg_bytes_to_data_url(pil_to_jpeg_bytes(img, quality=int(st.session_state.get("jpeg_q", 90))))
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": FORMULA_OCR_TO_LATEX_PROMPT_ZH},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }]
+            res = safe_chat_completions(
+                client=client,
+                model=st.session_state.get("ocr_model_id", "").strip() or get_default_model(),
+                messages=messages,
+                temperature=0.0,
+                max_tokens=int(formula_out_tokens),
+                timeout_s=int(st.session_state["ocr_timeout_s"]),
+                retries=6,
+            )
+            if res.error_message:
+                st.error(f"公式 OCR 失败：{res.error_message}")
+            else:
+                _ocr_latex = (res.text or "").strip()
+                # ✅ 正确做法：只维护一个编辑器 key；不要在 widget 创建后再写回同名 key
+                st.session_state["formula_latex_text"] = _ocr_latex
+                st.session_state["formula_latex_editor"] = _ocr_latex  # 这里在 text_area 渲染前写入，合法
+                st.success("公式识别完成，可在下方继续编辑。")
+        except Exception as e:
+            st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
-# --- LaTeX 编辑器（单一 key，避免 DuplicateElementKey / SessionState APIException） ---
-if "formula_latex_editor" not in st.session_state:
-    st.session_state["formula_latex_editor"] = st.session_state.get("formula_latex_text", "")
+    # --- LaTeX 编辑器（单一 key，避免 DuplicateElementKey / SessionState APIException） ---
+    if "formula_latex_editor" not in st.session_state:
+        st.session_state["formula_latex_editor"] = st.session_state.get("formula_latex_text", "")
 
-latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
-st.session_state["formula_latex_text"] = latex_text
+    latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
+    st.session_state["formula_latex_text"] = latex_text
 
-if latex_text.strip():
-    preview_expr = latex_text.strip()
-    st.markdown("**实时预览**")
-    try:
-        if st.session_state.get("formula_display_mode") == "行内（$...$）":
-            st.markdown(f"预览：${preview_expr}$")
-        else:
-            st.latex(preview_expr)
-    except Exception as e:
-        st.warning(f"预览渲染失败：{type(e).__name__}: {e}")
+    if latex_text.strip():
+        preview_expr = latex_text.strip()
+        st.markdown("**实时预览**")
+        try:
+            if st.session_state.get("formula_display_mode") == "行内（$...$）":
+                st.markdown(f"预览：${preview_expr}$")
+            else:
+                st.latex(preview_expr)
+        except Exception as e:
+            st.warning(f"预览渲染失败：{type(e).__name__}: {e}")
 
-wrapped = f"${latex_text.strip()}$" if st.session_state.get("formula_display_mode") == "行内（$...$）" else f"$$\n{latex_text.strip()}\n$$"
-
+    wrapped = f"${latex_text.strip()}$" if st.session_state.get("formula_display_mode") == "行内（$...$）" else f"$$\n{latex_text.strip()}\n$$"
 # ---------------------------
 with tabs[2]:
     st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
@@ -2672,7 +2672,7 @@ with tabs[2]:
                 client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
                 candidates = smart_extract_glossary_candidates(
                     client=client,
-                    model=st.session_state.get("translate_model_id", "").strip() or DEFAULT_TRANSLATE_MODEL,
+                    model=(st.session_state.get("glossary_model_id", "").strip() or get_default_model()),
                     preview_text=preview_text,
                     src_lang=src_lang,
                     dst_lang=dst_lang,
