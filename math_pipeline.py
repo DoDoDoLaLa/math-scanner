@@ -223,6 +223,25 @@ def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> Tuple[bytes, st
     return out, md
 
 
+def extract_docx_preview_text_for_glossary(docx_bytes: bytes, *, max_chars: int = 9000) -> str:
+    """Extract a lightweight text preview from DOCX for smart glossary mining.
+
+    Uses the existing Pandoc markdown pipeline so equations and document ordering remain
+    relatively stable, then returns a clipped plain-text-like preview.
+    """
+    if not docx_bytes:
+        return ""
+    md = docx_to_pandoc_markdown_for_math(docx_bytes, wrap_none=True)
+    if not md:
+        return ""
+    t = md.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"```[\s\S]*?```", "\n", t)
+    t = re.sub(r"\$\$[\s\S]*?\$\$", " [MATH_BLOCK] ", t)
+    t = re.sub(r"(?<!\$)\$([^$\n]+)\$(?!\$)", r" [MATH_INLINE: \1] ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[: int(max_chars)]
+
+
 # -----------------------------
 # AI-assisted cleaning (app passes in a callable)
 # -----------------------------
