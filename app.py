@@ -2544,6 +2544,7 @@ with tabs[0]:
 # ---------------------------
 # Tab 2: Formula OCR -> LaTeX immersive editor
 # ---------------------------
+FORMULA_EDITOR_WIDGET_KEY = "__tab2_formula_latex_editor_v1__"
 with tabs[1]:
     st.subheader("公式 OCR → LaTeX（可编辑 + 实时预览）")
     st.caption("上传公式截图，自动转 LaTeX；可手动编辑并实时预览，支持复制。")
@@ -2583,12 +2584,20 @@ with tabs[1]:
             else:
                 _ocr_latex = (res.text or "").strip()
                 st.session_state["formula_latex_text"] = _ocr_latex
+                st.session_state["formula_latex_editor"] = _ocr_latex  # backward-compatible state
+                st.session_state[FORMULA_EDITOR_WIDGET_KEY] = _ocr_latex
                 st.session_state["formula_latex_editor"] = _ocr_latex
                 st.session_state["formula_latex_text"] = (res.text or "").strip()
                 st.success("公式识别完成，可在下方继续编辑。")
         except Exception as e:
             st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
+    # 使用独立且唯一的 widget key，避免历史 merge 后重复 key 引发 StreamlitDuplicateElementKey。
+    if FORMULA_EDITOR_WIDGET_KEY not in st.session_state and st.session_state.get("formula_latex_editor"):
+        st.session_state[FORMULA_EDITOR_WIDGET_KEY] = st.session_state.get("formula_latex_editor", "")
+    latex_text = st.text_area("LaTeX 编辑器", height=220, key=FORMULA_EDITOR_WIDGET_KEY)
+    st.session_state["formula_latex_text"] = latex_text
+    st.session_state["formula_latex_editor"] = latex_text  # backward-compatible state mirror
     # 关键修复：编辑器使用同一个 key，识别结果直接写入该 key，避免“识别成功但编辑器为空”。
     # 兼容修复：若分支合并导致重复 key，自动回退到备用 key，避免整个页面崩溃。
     try:
