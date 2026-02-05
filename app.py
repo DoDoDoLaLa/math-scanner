@@ -2384,7 +2384,6 @@ tabs = st.tabs([
     "② 公式 OCR → LaTeX（沉浸编辑）",
     "③ Word(.docx) → 保排版翻译/就地替换公式（best-effort）",
     "④ Word(.docx) → LaTeX/Markdown 直接导出（推荐）",
-    "⑤ 标题格式化",
 ])
 
 # ---------------------------
