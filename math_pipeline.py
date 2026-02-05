@@ -245,6 +245,140 @@ def extract_docx_preview_text_for_glossary(docx_bytes: bytes, *, max_chars: int 
     return t[: int(max_chars)]
 
 
+
+
+# -----------------------------
+# Title formatting (python-docx only, no AI)
+# -----------------------------
+def _extract_heading_level_from_style_name(style_name: str) -> Optional[int]:
+    if not style_name:
+        return None
+    name = str(style_name).strip()
+    m = re.search(r"(?:^|\s)Heading\s*([1-9])(?:\s|$)", name, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:^|\s)标题\s*([1-9])(?:\s|$)", name)
+    if m:
+        return int(m.group(1))
+    if re.search(r"heading\s*1", name, flags=re.IGNORECASE) or "标题1" in name:
+        return 1
+    if re.search(r"heading\s*2", name, flags=re.IGNORECASE) or "标题2" in name:
+        return 2
+    if re.search(r"heading\s*3", name, flags=re.IGNORECASE) or "标题3" in name:
+        return 3
+    return None
+
+
+def detect_heading_level_for_paragraph(paragraph) -> Optional[int]:
+    """Detect heading level by paragraph style only (no AI).
+
+    Returns 1/2/3 for title levels, otherwise None.
+    """
+    try:
+        style_name = paragraph.style.name if paragraph.style is not None else ""
+    except Exception:
+        style_name = ""
+    lv = _extract_heading_level_from_style_name(style_name)
+    if lv in (1, 2, 3):
+        return lv
+    return None
+
+
+def analyze_docx_headings(docx_bytes: bytes) -> List[dict]:
+    """Analyze each paragraph and classify as heading1/2/3 or normal."""
+    if not docx_bytes:
+        return []
+    doc = Document(io.BytesIO(docx_bytes))
+    out: List[dict] = []
+    for idx, p in enumerate(doc.paragraphs, start=1):
+        lv = detect_heading_level_for_paragraph(p)
+        ptype = f"Heading {lv}" if lv else "Normal"
+        out.append({
+            "index": idx,
+            "text": (p.text or "").strip(),
+            "type": ptype,
+            "level": lv,
+            "style_name": p.style.name if p.style is not None else "",
+        })
+    return out
+
+
+def _set_run_font(run, *, font_name: str, size_pt: float, bold: bool) -> None:
+    run.font.name = font_name
+    run.bold = bool(bold)
+    run.font.bold = bool(bold)
+    run.font.size = Pt(float(size_pt))
+    # Ensure East Asian font also follows configured name.
+    try:
+        rfonts = run._element.rPr.rFonts if run._element.rPr is not None else None
+        if rfonts is None:
+            run._element.get_or_add_rPr().get_or_add_rFonts()
+            rfonts = run._element.rPr.rFonts
+        rfonts.set(qn("w:eastAsia"), font_name)
+        rfonts.set(qn("w:ascii"), font_name)
+        rfonts.set(qn("w:hAnsi"), font_name)
+    except Exception:
+        pass
+
+
+def apply_title_formatting_to_docx(docx_bytes: bytes, level_styles: dict) -> bytes:
+    """Apply user-configured run font formatting to Heading1/2/3 paragraphs."""
+    if not docx_bytes:
+        return docx_bytes
+    doc = Document(io.BytesIO(docx_bytes))
+
+    for p in doc.paragraphs:
+        lv = detect_heading_level_for_paragraph(p)
+        if lv not in (1, 2, 3):
+            continue
+        cfg = level_styles.get(int(lv)) or {}
+        font_name = str(cfg.get("font_name", "SimHei") or "SimHei")
+        size_pt = float(cfg.get("size_pt", 16))
+        bold = bool(cfg.get("bold", True))
+        for r in p.runs:
+            _set_run_font(r, font_name=font_name, size_pt=size_pt, bold=bold)
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def selftest_title_formatting() -> dict:
+    """Built-in sample test case for heading analysis + formatting."""
+    d = Document()
+    p1 = d.add_paragraph("第一章 介绍", style="Heading 1")
+    p2 = d.add_paragraph("1.1 背景", style="Heading 2")
+    p3 = d.add_paragraph("1.1.1 定义", style="Heading 3")
+    p4 = d.add_paragraph("普通正文段落", style="Normal")
+    b = io.BytesIO(); d.save(b)
+
+    analyzed = analyze_docx_headings(b.getvalue())
+    counts = {"Heading 1": 0, "Heading 2": 0, "Heading 3": 0, "Normal": 0}
+    for x in analyzed:
+        counts[x["type"]] = counts.get(x["type"], 0) + 1
+
+    styled = apply_title_formatting_to_docx(
+        b.getvalue(),
+        {
+            1: {"font_name": "SimHei", "size_pt": 18, "bold": True},
+            2: {"font_name": "SimHei", "size_pt": 16, "bold": True},
+            3: {"font_name": "SimHei", "size_pt": 14, "bold": False},
+        },
+    )
+    d2 = Document(io.BytesIO(styled))
+    h1 = d2.paragraphs[0].runs[0]
+    h3 = d2.paragraphs[2].runs[0]
+
+    ok = (
+        counts.get("Heading 1", 0) == 1
+        and counts.get("Heading 2", 0) == 1
+        and counts.get("Heading 3", 0) == 1
+        and counts.get("Normal", 0) == 1
+        and bool(h1.bold) is True
+        and bool(h3.bold) is False
+    )
+    return {"ok": bool(ok), "counts": counts}
+
 # -----------------------------
 # AI-assisted cleaning (app passes in a callable)
 # -----------------------------
