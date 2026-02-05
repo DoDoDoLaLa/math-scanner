@@ -317,6 +317,9 @@ def _cached_ai_roundtrip(
         docx_bytes,
         call_llm=call_llm,
         max_batch_chars=int(max_batch_chars),
+        glossary_map=parse_glossary_mapping(st.session_state.get("glossary_text", "")),
+        enable_qa_retry=bool(st.session_state.get("qa_enable", True)),
+        qa_retries=int(st.session_state.get("qa_retries", 2)),
         progress_cb=None,
     )
 
@@ -2553,58 +2556,68 @@ with tabs[1]:
         st.selectbox("预览模式", ["行间（$$...$$）", "行内（$...$）"], key="formula_display_mode")
     with cfm3:
         run_formula_ocr = st.button("识别公式并填入编辑器", type="primary", disabled=not formula_file, key="btn_formula_ocr")
-if run_formula_ocr and formula_file:
-    try:
-        client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
-        img = Image.open(io.BytesIO(read_uploaded_bytes(formula_file))).convert("RGB")
-        data_url = _jpeg_bytes_to_data_url(pil_to_jpeg_bytes(img, quality=int(st.session_state.get("jpeg_q", 90))))
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": FORMULA_OCR_TO_LATEX_PROMPT_ZH},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }]
-        res = safe_chat_completions(
-            client=client,
-            model=st.session_state.get("ocr_model_id", "").strip() or get_default_model(),
-            messages=messages,
-            temperature=0.0,
-            max_tokens=int(formula_out_tokens),
-            timeout_s=int(st.session_state["ocr_timeout_s"]),
-            retries=6,
-        )
-        if res.error_message:
-            st.error(f"公式 OCR 失败：{res.error_message}")
-        else:
-            _ocr_latex = (res.text or "").strip()
-            # ✅ 正确做法：只维护一个编辑器 key；不要在 widget 创建后再写回同名 key
-            st.session_state["formula_latex_text"] = _ocr_latex
-            st.session_state["formula_latex_editor"] = _ocr_latex  # 这里在 text_area 渲染前写入，合法
-            st.success("公式识别完成，可在下方继续编辑。")
-    except Exception as e:
-        st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
-# --- LaTeX 编辑器（单一 key，避免 DuplicateElementKey / SessionState APIException） ---
-if "formula_latex_editor" not in st.session_state:
-    st.session_state["formula_latex_editor"] = st.session_state.get("formula_latex_text", "")
+    if run_formula_ocr and formula_file:
+        try:
+            client = get_ark_client(default_timeout_s=int(st.session_state["ocr_timeout_s"]))
+            img = Image.open(io.BytesIO(read_uploaded_bytes(formula_file))).convert("RGB")
+            data_url = _jpeg_bytes_to_data_url(pil_to_jpeg_bytes(img, quality=int(st.session_state.get("jpeg_q", 90))))
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": FORMULA_OCR_TO_LATEX_PROMPT_ZH},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }]
+            res = safe_chat_completions(
+                client=client,
+                model=st.session_state.get("ocr_model_id", "").strip() or get_default_model(),
+                messages=messages,
+                temperature=0.0,
+                max_tokens=int(formula_out_tokens),
+                timeout_s=int(st.session_state["ocr_timeout_s"]),
+                retries=6,
+            )
+            if res.error_message:
+                st.error(f"公式 OCR 失败：{res.error_message}")
+            else:
+                _ocr_latex = (res.text or "").strip()
+                st.session_state["formula_latex_text"] = _ocr_latex
+                st.session_state["formula_latex_editor"] = _ocr_latex
+                st.session_state["formula_latex_text"] = (res.text or "").strip()
+                st.success("公式识别完成，可在下方继续编辑。")
+        except Exception as e:
+            st.error(f"公式 OCR 调用失败：{type(e).__name__}: {e}")
 
-latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
-st.session_state["formula_latex_text"] = latex_text
+    # 关键修复：公式编辑器只创建一次（key 必须全局唯一），并且只在 widget 创建之前写入 session_state。
+    if "formula_latex_editor" not in st.session_state:
+        st.session_state["formula_latex_editor"] = ""
 
+    latex_text = st.text_area("LaTeX 编辑器", height=220, key="formula_latex_editor")
 if latex_text.strip():
-    preview_expr = latex_text.strip()
-    st.markdown("**实时预览**")
-    try:
-        if st.session_state.get("formula_display_mode") == "行内（$...$）":
-            st.markdown(f"预览：${preview_expr}$")
-        else:
-            st.latex(preview_expr)
-    except Exception as e:
-        st.warning(f"预览渲染失败：{type(e).__name__}: {e}")
+        preview_expr = latex_text.strip()
+        st.markdown("**实时预览**")
+        try:
+            if st.session_state.get("formula_display_mode") == "行内（$...$）":
+                st.markdown(f"预览：${preview_expr}$")
+            else:
+                st.latex(preview_expr)
+        except Exception as e:
+            st.warning(f"预览渲染失败：{type(e).__name__}: {e}")
 
-wrapped = f"${latex_text.strip()}$" if st.session_state.get("formula_display_mode") == "行内（$...$）" else f"$$\n{latex_text.strip()}\n$$"
+    wrapped = f"${latex_text.strip()}$" if st.session_state.get("formula_display_mode") == "行内（$...$）" else f"$$\n{latex_text.strip()}\n$$"
+    st.code(wrapped if latex_text.strip() else "", language="latex")
+    st.download_button(
+        "下载 LaTeX 文本（.txt）",
+        data=(wrapped if latex_text.strip() else "").encode("utf-8"),
+        file_name="formula_latex.txt",
+        mime="text/plain",
+        key="dl_formula_latex_txt",
+    )
 
+
+# ---------------------------
+# Tab 3: DOCX translate + best-effort equation replace
 # ---------------------------
 with tabs[2]:
     st.subheader("Word(.docx) → 保排版翻译 / 公式就地替换（best-effort）")
@@ -2656,6 +2669,7 @@ with tabs[2]:
 
     with st.expander("智能术语提取（Smart Glossary Extraction）", expanded=False):
         st.caption("翻译前可先预扫描文档前部内容，自动提取 top-K 术语候选，勾选后写入术语表。")
+        st.text_input("术语提取使用的 model（不要用翻译专用模型）", key="smart_glossary_model_id", value=st.session_state.get("ocr_model_id", "").strip() or DEFAULT_OCR_MODEL)
         csg1, csg2 = st.columns(2)
         with csg1:
             st.number_input("预扫描字符数", min_value=2000, max_value=30000, step=500, key="smart_glossary_preview_chars")
@@ -2672,7 +2686,7 @@ with tabs[2]:
                 client = get_ark_client(default_timeout_s=int(st.session_state["translate_timeout_s"]))
                 candidates = smart_extract_glossary_candidates(
                     client=client,
-                    model=st.session_state.get("translate_model_id", "").strip() or DEFAULT_TRANSLATE_MODEL,
+                    model=st.session_state.get("smart_glossary_model_id", "").strip() or (st.session_state.get("ocr_model_id","").strip() or DEFAULT_OCR_MODEL),
                     preview_text=preview_text,
                     src_lang=src_lang,
                     dst_lang=dst_lang,
@@ -3093,15 +3107,106 @@ def docx_to_pandoc_markdown_for_math(docx_bytes: bytes) -> str:
 
 
 # ---------------------------
-# Tab 5: Title formatting (rule-based + optional AI review)
+# Tab 5: Title formatting (python-docx only)
 # ---------------------------
+if len(tabs) > 4:
+    with tabs[4]:
+        st.markdown("---")
+        st.subheader("标题格式化（纯程序逻辑，无 AI）")
+        st.caption("上传 .docx 后，按段落样式识别 Heading 1/2/3，并按你配置的字体名/字号/粗体批量写回导出。")
+
+        st.markdown(
+            "**说明（识别规则）**：仅根据段落样式名判断标题级别（如 `Heading 1/2/3`、`标题 1/2/3`），其余视为普通段落。"
+        )
+
+        docx_title_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_title_format")
+
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            st.markdown("**一级标题样式**")
+            h1_font = st.text_input("字体名（H1）", value="SimHei", key="h1_font")
+            h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=18.0, step=0.5, key="h1_size")
+            h1_bold = st.checkbox("加粗（H1）", value=True, key="h1_bold")
+        with col_t2:
+            st.markdown("**二级标题样式**")
+            h2_font = st.text_input("字体名（H2）", value="SimHei", key="h2_font")
+            h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h2_size")
+            h2_bold = st.checkbox("加粗（H2）", value=True, key="h2_bold")
+        with col_t3:
+            st.markdown("**三级标题样式**")
+            h3_font = st.text_input("字体名（H3）", value="SimHei", key="h3_font")
+            h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h3_size")
+            h3_bold = st.checkbox("加粗（H3）", value=False, key="h3_bold")
+
+        if st.button("解析文档标题结构", disabled=not docx_title_file, key="btn_analyze_titles"):
+            try:
+                title_doc_bytes = read_uploaded_bytes(docx_title_file)
+                rows = mp.analyze_docx_headings(title_doc_bytes)
+                st.session_state["title_rows"] = rows
+                c1 = sum(1 for r in rows if r.get("level") == 1)
+                c2 = sum(1 for r in rows if r.get("level") == 2)
+                c3 = sum(1 for r in rows if r.get("level") == 3)
+                cn = sum(1 for r in rows if not r.get("level"))
+                st.success(f"解析完成：H1={c1}, H2={c2}, H3={c3}, 普通段落={cn}")
+            except Exception as e:
+                st.error(f"解析失败：{type(e).__name__}: {e}")
+
+        rows = st.session_state.get("title_rows", []) if docx_title_file else []
+        if rows:
+            st.dataframe(rows, use_container_width=True, height=320)
+
+        if st.button("应用样式并导出", type="primary", disabled=not docx_title_file, key="btn_apply_title_style"):
+            try:
+                title_doc_bytes = read_uploaded_bytes(docx_title_file)
+                cfg = {
+                    1: {"font_name": h1_font, "size_pt": h1_size, "bold": h1_bold},
+                    2: {"font_name": h2_font, "size_pt": h2_size, "bold": h2_bold},
+                    3: {"font_name": h3_font, "size_pt": h3_size, "bold": h3_bold},
+                }
+                out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg)
+                st.success("标题样式已应用并生成新文档。")
+                st.download_button(
+                    "下载：TitleFormatted.docx",
+                    data=out_docx,
+                    file_name="TitleFormatted.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_title_formatted",
+                )
+            except Exception as e:
+                st.error(f"导出失败：{type(e).__name__}: {e}")
+
+        with st.expander("模板与样例测试说明", expanded=False):
+            st.markdown(
+                """
+    **template.docx 如何构造**
+    1. 在 Word 中新建文档。
+    2. 为一级/二级/三级标题段落分别使用内置样式：`Heading 1`、`Heading 2`、`Heading 3`（中文界面常显示为“标题 1/2/3”）。
+    3. 正文使用 `Normal`（正文）样式。
+    4. 保存为 `template.docx` 后上传即可。
+
+    **内置 sample 测试用例**
+    - 点击下方按钮会在内存中构造一个 4 段文档：H1/H2/H3/正文各一段。
+    - 程序会执行“解析 + 应用样式”，并检查计数与粗体设置是否符合预期。
+                """
+            )
+            if st.button("运行内置 sample 测试", key="btn_title_selftest"):
+                try:
+                    result = mp.selftest_title_formatting()
+                    if result.get("ok"):
+                        st.success(f"Sample 测试通过：{result}")
+                    else:
+                        st.error(f"Sample 测试未通过：{result}")
+                except Exception as e:
+                    st.error(f"Sample 测试失败：{type(e).__name__}: {e}")
+else:
+    st.info("当前运行版本未启用第⑤页（标题格式化），请切到包含该功能的分支/最新提交。")
 with tabs[4]:
     st.markdown("---")
-    st.subheader("标题格式化（规则识别 + 可选 AI 审查增强）")
-    st.caption("默认仅根据段落样式名识别 Heading 1/2/3；若文档样式不规范，可启用 AI 审查提升识别准确度（不改变原有功能）。")
+    st.subheader("标题格式化（纯程序逻辑，无 AI）")
+    st.caption("上传 .docx 后，按段落样式识别 Heading 1/2/3，并按你配置的字体名/字号/粗体批量写回导出。")
 
     st.markdown(
-        "**规则识别（默认）**：仅根据段落样式名判断标题级别（如 `Heading 1/2/3`、`标题 1/2/3`），其余视为普通段落。"
+        "**说明（识别规则）**：仅根据段落样式名判断标题级别（如 `Heading 1/2/3`、`标题 1/2/3`），其余视为普通段落。"
     )
 
     docx_title_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_title_format")
@@ -3110,27 +3215,20 @@ with tabs[4]:
     with col_t1:
         st.markdown("**一级标题样式**")
         h1_font = st.text_input("字体名（H1）", value="SimHei", key="h1_font")
-        h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h1_size")
+        h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=18.0, step=0.5, key="h1_size")
         h1_bold = st.checkbox("加粗（H1）", value=True, key="h1_bold")
     with col_t2:
         st.markdown("**二级标题样式**")
         h2_font = st.text_input("字体名（H2）", value="SimHei", key="h2_font")
-        h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h2_size")
+        h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h2_size")
         h2_bold = st.checkbox("加粗（H2）", value=True, key="h2_bold")
     with col_t3:
         st.markdown("**三级标题样式**")
         h3_font = st.text_input("字体名（H3）", value="SimHei", key="h3_font")
-        h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=12.0, step=0.5, key="h3_size")
-        h3_bold = st.checkbox("加粗（H3）", value=True, key="h3_bold")
+        h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h3_size")
+        h3_bold = st.checkbox("加粗（H3）", value=False, key="h3_bold")
 
-    cfg = {
-        1: {"font_name": h1_font, "size_pt": float(h1_size), "bold": bool(h1_bold)},
-        2: {"font_name": h2_font, "size_pt": float(h2_size), "bold": bool(h2_bold)},
-        3: {"font_name": h3_font, "size_pt": float(h3_size), "bold": bool(h3_bold)},
-    }
-
-    # ---- rule-based analyze ----
-    if st.button("解析文档标题结构（规则）", disabled=not docx_title_file, key="btn_analyze_titles"):
+    if st.button("解析文档标题结构", disabled=not docx_title_file, key="btn_analyze_titles"):
         try:
             title_doc_bytes = read_uploaded_bytes(docx_title_file)
             rows = mp.analyze_docx_headings(title_doc_bytes)
@@ -3147,125 +3245,15 @@ with tabs[4]:
     if rows:
         st.dataframe(rows, use_container_width=True, height=320)
 
-    # ---- optional AI review ----
-    st.markdown("---")
-    st.markdown("### AI 审查/增强识别（可选）")
-    ai_enable = st.checkbox("启用 AI 审查/增强识别（当文档未正确设置标题样式时）", value=False, key="ai_title_enable")
-
-    ai_model_default = st.session_state.get("ocr_model_id", "").strip() or "ep-20260203141749-992fx"
-    ai_model = st.text_input("AI 审查使用的 model（建议：OCR model）", value=ai_model_default, key="ai_title_model")
-    ai_max_paras = st.number_input("AI 审查最多处理段落数", min_value=50, max_value=4000, value=400, step=50, key="ai_title_max_paras")
-    ai_timeout_s = st.number_input("AI 单次请求超时（秒）", min_value=10, max_value=600, value=120, step=10, key="ai_title_timeout_s")
-
-    def _ai_review_titles(docx_bytes: bytes) -> dict:
-        # Extract paragraph texts with indices for LLM classification (no OCR, no images).
-        doc = Document(io.BytesIO(docx_bytes))
-        paras = [p.text.strip() for p in doc.paragraphs]
-        items = []
-        for i, t in enumerate(paras[: int(ai_max_paras)]):
-            if not t:
-                continue
-            items.append({"i": i, "text": t[:400]})
-        prompt = (
-            "你是论文/讲义排版审查员。现在我给你一个 Word 文档的段落列表（只给纯文本，可能未设置 Heading 样式）。\n"
-            "请你判断哪些段落应当是标题，并给出标题级别 1/2/3。\n\n"
-            "输出必须是 JSON 对象，格式：\n"
-            "{\n  \"items\": [ { \"i\": 12, \"level\": 1 }, ... ]\n}\n\n"
-            "规则：\n"
-            "1) 只标注你有把握的标题；不确定就不要输出该段落。\n"
-            "2) level 只能是 1/2/3。\n"
-            "3) 不要输出解释。\n\n"
-            "段落列表（JSON）：\n"
-            + json.dumps({"paras": items}, ensure_ascii=False)
-        )
-        client = get_ark_client(default_timeout_s=int(ai_timeout_s))
-        res = safe_chat_completions(
-            client=client,
-            model=ai_model.strip(),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=4096,
-            timeout_s=int(ai_timeout_s),
-            retries=6,
-            response_format={"type": "json_object"},
-        )
-        if res.error_message:
-            raise RuntimeError(res.error_message)
-        obj = extract_json_object(res.text)
-        if not isinstance(obj, dict):
-            return {"items": []}
-        items2 = obj.get("items", [])
-        if not isinstance(items2, list):
-            items2 = []
-        cleaned = []
-        for it in items2:
-            if not isinstance(it, dict):
-                continue
-            i = it.get("i")
-            lvl = it.get("level")
-            if isinstance(i, int) and lvl in (1, 2, 3):
-                cleaned.append({"i": i, "level": int(lvl)})
-        return {"items": cleaned}
-
-    if ai_enable and st.button("运行 AI 审查（生成标题级别建议）", disabled=not docx_title_file, key="btn_ai_title_review"):
+    if st.button("应用样式并导出", type="primary", disabled=not docx_title_file, key="btn_apply_title_style"):
         try:
             title_doc_bytes = read_uploaded_bytes(docx_title_file)
-            ai_suggest = _ai_review_titles(title_doc_bytes)
-            st.session_state["ai_title_suggest"] = ai_suggest
-            st.success(f"AI 审查完成：建议标题数={len(ai_suggest.get('items', []))}")
-        except Exception as e:
-            st.error(f"AI 审查失败：{type(e).__name__}: {e}")
-
-    ai_suggest = st.session_state.get("ai_title_suggest", {})
-    if ai_enable and ai_suggest.get("items"):
-        st.json(ai_suggest)
-
-    # ---- apply/export ----
-    def _apply_title_formatting_with_ai(docx_bytes: bytes, cfg: dict, ai_suggest: dict) -> bytes:
-        # First apply rule-based styling (preserves original behavior)
-        out1 = mp.apply_title_formatting_to_docx(docx_bytes, cfg)
-
-        # If AI suggests more, apply run-level formatting to those paragraphs too.
-        items = ai_suggest.get("items", []) if isinstance(ai_suggest, dict) else []
-        if not items:
-            return out1
-
-        doc = Document(io.BytesIO(out1))
-        idx_to_level = {int(it["i"]): int(it["level"]) for it in items if isinstance(it, dict) and "i" in it and "level" in it}
-        for i, p in enumerate(doc.paragraphs):
-            lvl = idx_to_level.get(i)
-            if lvl not in (1, 2, 3):
-                continue
-            style_cfg = cfg.get(lvl, {})
-            font_name = style_cfg.get("font_name") or None
-            size_pt = style_cfg.get("size_pt") or None
-            bold = style_cfg.get("bold")
-            # Apply to all runs (create one if empty)
-            if not p.runs:
-                p.add_run(p.text or "")
-            for r in p.runs:
-                if font_name:
-                    r.font.name = font_name
-                    try:
-                        r._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
-                    except Exception:
-                        pass
-                if size_pt:
-                    r.font.size = Pt(float(size_pt))
-                if bold is not None:
-                    r.bold = bool(bold)
-
-        bio = io.BytesIO()
-        doc.save(bio)
-        return bio.getvalue()
-
-    if st.button("应用样式并导出（可叠加 AI 建议）", type="primary", disabled=not docx_title_file, key="btn_apply_title_style"):
-        try:
-            title_doc_bytes = read_uploaded_bytes(docx_title_file)
-            if ai_enable and ai_suggest.get("items"):
-                out_docx = _apply_title_formatting_with_ai(title_doc_bytes, cfg, ai_suggest)
-            else:
-                out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg)
+            cfg = {
+                1: {"font_name": h1_font, "size_pt": h1_size, "bold": h1_bold},
+                2: {"font_name": h2_font, "size_pt": h2_size, "bold": h2_bold},
+                3: {"font_name": h3_font, "size_pt": h3_size, "bold": h3_bold},
+            }
+            out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg)
             st.success("标题样式已应用并生成新文档。")
             st.download_button(
                 "下载：TitleFormatted.docx",
@@ -3276,3 +3264,50 @@ with tabs[4]:
             )
         except Exception as e:
             st.error(f"导出失败：{type(e).__name__}: {e}")
+
+    with st.expander("模板与样例测试说明", expanded=False):
+        st.markdown(
+            """
+**template.docx 如何构造**
+1. 在 Word 中新建文档。
+2. 为一级/二级/三级标题段落分别使用内置样式：`Heading 1`、`Heading 2`、`Heading 3`（中文界面常显示为“标题 1/2/3”）。
+3. 正文使用 `Normal`（正文）样式。
+4. 保存为 `template.docx` 后上传即可。
+
+**内置 sample 测试用例**
+- 点击下方按钮会在内存中构造一个 4 段文档：H1/H2/H3/正文各一段。
+- 程序会执行“解析 + 应用样式”，并检查计数与粗体设置是否符合预期。
+            """
+        )
+        if st.button("运行内置 sample 测试", key="btn_title_selftest"):
+            try:
+                result = mp.selftest_title_formatting()
+                if result.get("ok"):
+                    st.success(f"Sample 测试通过：{result}")
+                else:
+                    st.error(f"Sample 测试未通过：{result}")
+            except Exception as e:
+                st.error(f"Sample 测试失败：{type(e).__name__}: {e}")
+
+
+def docx_roundtrip_make_equations_editable(docx_bytes: bytes) -> bytes:
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_roundtrip_omml(sha, docx_bytes)
+
+def docx_roundtrip_make_equations_editable_with_md(docx_bytes: bytes):
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_roundtrip_omml_with_md(sha, docx_bytes)
+
+def docx_ai_roundtrip_make_equations_editable(
+    docx_bytes: bytes,
+    *,
+    model: str,
+    max_batch_chars: int,
+    timeout_s: int,
+    out_tokens: int,
+    base_url: str,
+):
+    sha = mp.sha256_bytes(docx_bytes)
+    return _cached_ai_roundtrip(
+        sha, docx_bytes, model, int(max_batch_chars), int(timeout_s), int(out_tokens), str(base_url)
+    )
