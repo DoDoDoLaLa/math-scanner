@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import re
+import json
 import hashlib
 import tempfile
 from pathlib import Path
@@ -61,6 +62,41 @@ def normalize_md(md: str) -> str:
     return md
 
 
+# -----------------------------
+# Pandoc JSON AST semantic blocks (for robust chunking)
+# -----------------------------
+def pandoc_markdown_to_semantic_blocks(md: str) -> List[dict]:
+    """Split markdown into top-level Pandoc blocks, returning a list of dicts:
+    {type: <BlockType>, markdown: <block_markdown>}
+
+    This is useful for translation chunking without breaking tables/lists/etc.
+    """
+    ensure_pandoc()
+    md = normalize_md(md) + "\n"
+    js = pypandoc.convert_text(md, to="json", format="markdown+tex_math_dollars")
+    root = json.loads(js)
+    api_ver = root.get("pandoc-api-version")
+    blocks = root.get("blocks") or []
+    out: List[dict] = []
+
+    for b in blocks:
+        b_type = (b.get("t") if isinstance(b, dict) else None) or "Unknown"
+        mini = {"pandoc-api-version": api_ver, "meta": {}, "blocks": [b]}
+        md_block = pypandoc.convert_text(json.dumps(mini, ensure_ascii=False), to="markdown+tex_math_dollars", format="json")
+        out.append({"type": b_type, "markdown": normalize_md(md_block)})
+
+    return out
+
+
+def join_semantic_blocks(blocks: List[dict]) -> str:
+    """Join blocks produced by pandoc_markdown_to_semantic_blocks back to markdown."""
+    parts: List[str] = []
+    for b in blocks or []:
+        if isinstance(b, dict):
+            parts.append((b.get("markdown") or "").strip())
+        else:
+            parts.append(str(b).strip())
+    return normalize_md("\n\n".join([p for p in parts if p]))
 # -----------------------------
 # Pandoc math normalization / sanitization
 # -----------------------------
@@ -321,22 +357,96 @@ def _set_run_font(run, *, font_name: str, size_pt: float, bold: bool) -> None:
         pass
 
 
-def apply_title_formatting_to_docx(docx_bytes: bytes, level_styles: dict) -> bytes:
-    """Apply user-configured run font formatting to Heading1/2/3 paragraphs."""
+def apply_title_formatting_to_docx(
+    docx_bytes: bytes,
+    level_styles: dict,
+    *,
+    apply_to_body: bool = False,
+    body_style: Optional[dict] = None,
+    apply_to_tables: bool = False,
+    table_style: Optional[dict] = None,
+    apply_to_captions: bool = False,
+    caption_style: Optional[dict] = None,
+) -> bytes:
+    """Apply user-configured run font formatting.
+
+    Backward compatible:
+    - Always formats Heading 1/2/3 based on detect_heading_level_for_paragraph.
+    - Optionally (when toggled) also formats:
+        * body paragraphs (non-heading)
+        * tables (all cell paragraphs)
+        * captions (heuristic by style name)
+    """
     if not docx_bytes:
         return docx_bytes
+
     doc = Document(io.BytesIO(docx_bytes))
 
+    # Prepare optional styles (safe defaults)
+    body_style = body_style or {}
+    table_style = table_style or {}
+    caption_style = caption_style or {}
+
+    def _norm_style(cfg: dict, default_font: str, default_size: float, default_bold: bool) -> Tuple[str, float, bool]:
+        font_name = str(cfg.get("font_name") or default_font)
+        size_pt = float(cfg.get("size_pt") or default_size)
+        bold = bool(cfg.get("bold") if cfg.get("bold") is not None else default_bold)
+        return font_name, size_pt, bold
+
+    def _is_caption_para(p) -> bool:
+        try:
+            s = (p.style.name or "").lower()
+        except Exception:
+            s = ""
+        if not s:
+            return False
+        # Common caption styles in Word / Chinese Word
+        keys = ["caption", "题注", "图题", "表题", "figure caption", "table caption"]
+        return any(k.lower() in s for k in keys)
+
+    # 1) headings (always on)
     for p in doc.paragraphs:
         lv = detect_heading_level_for_paragraph(p)
         if lv not in (1, 2, 3):
             continue
         cfg = level_styles.get(int(lv)) or {}
-        font_name = str(cfg.get("font_name", "SimHei") or "SimHei")
-        size_pt = float(cfg.get("size_pt", 16))
-        bold = bool(cfg.get("bold", True))
-        for r in p.runs:
+        font_name, size_pt, bold = _norm_style(cfg, "SimHei", 16.0, True)
+        for r in (p.runs or []):
             _set_run_font(r, font_name=font_name, size_pt=size_pt, bold=bold)
+
+    # 2) body/captions (optional)
+    if apply_to_body or apply_to_captions:
+        b_font, b_size, b_bold = _norm_style(body_style, "Times New Roman", 11.0, False)
+        c_font, c_size, c_bold = _norm_style(caption_style, b_font, b_size, b_bold)
+
+        for p in doc.paragraphs:
+            lv = detect_heading_level_for_paragraph(p)
+            if lv in (1, 2, 3):
+                continue
+
+            if apply_to_captions and _is_caption_para(p):
+                font_name, size_pt, bold = c_font, c_size, c_bold
+            elif apply_to_body:
+                font_name, size_pt, bold = b_font, b_size, b_bold
+            else:
+                continue
+
+            if not p.runs:
+                p.add_run(p.text or "")
+            for r in p.runs:
+                _set_run_font(r, font_name=font_name, size_pt=size_pt, bold=bold)
+
+    # 3) tables (optional)
+    if apply_to_tables:
+        t_font, t_size, t_bold = _norm_style(table_style, "Times New Roman", 10.5, False)
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        if not p.runs:
+                            p.add_run(p.text or "")
+                        for r in p.runs:
+                            _set_run_font(r, font_name=t_font, size_pt=t_size, bold=t_bold)
 
     out = io.BytesIO()
     doc.save(out)
