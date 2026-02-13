@@ -237,6 +237,28 @@ except Exception:
 # ============================================================
 st.set_page_config(page_title="Ark OCR / DOCX Translate / LaTeX Export", layout="wide")
 
+
+# -----------------------------
+# UI helpers: font picker (dropdown + custom)
+# -----------------------------
+COMMON_FONTS_ZH = ["SimSun", "SimHei", "Microsoft YaHei", "FangSong", "KaiTi", "STSong", "STHeiti", "STKaiti", "STFangsong"]
+COMMON_FONTS_EN = ["Times New Roman", "Arial", "Calibri", "Cambria", "Georgia", "Garamond"]
+COMMON_FONTS_ALL = COMMON_FONTS_ZH + [f for f in COMMON_FONTS_EN if f not in COMMON_FONTS_ZH]
+FONT_PICKER_SENTINEL_CUSTOM = "自定义…"
+
+def ui_font_picker(label: str, *, key_prefix: str, default: str = "SimHei") -> str:
+    """Return chosen font name. Provides dropdown + optional custom input."""
+    opts = COMMON_FONTS_ALL + [FONT_PICKER_SENTINEL_CUSTOM]
+    default = default or "SimHei"
+    if default in opts:
+        default_idx = opts.index(default)
+    else:
+        default_idx = opts.index(FONT_PICKER_SENTINEL_CUSTOM)
+    sel = st.selectbox(label, opts, index=default_idx, key=f"{key_prefix}_sel")
+    if sel == FONT_PICKER_SENTINEL_CUSTOM:
+        return st.text_input("自定义字体名", value=default, key=f"{key_prefix}_custom").strip() or default
+    return sel
+
 st.markdown(
     """<style>
     .stTabs [data-baseweb="tab"] {font-size: 15px; padding: 10px 14px;}
@@ -594,6 +616,7 @@ def _cached_pandoc_translate_ocr_route(
     max_batch_chars: int,
     glossary_text: str = "",
     glossary_allow_substring: bool = False,
+    reference_docx_bytes: Optional[bytes] = None,
 ) -> Tuple[str, bytes, str, Dict[str, Any]]:
     """
     Direct route (no Pandoc pre-conversion):
@@ -615,7 +638,7 @@ def _cached_pandoc_translate_ocr_route(
         attempt_msg_cb=None,
         glossary_allow_substring=bool(glossary_allow_substring),
     )
-    out_docx = mp.pandoc_markdown_to_docx(md_tr, reference_docx_bytes=docx_bytes)
+    out_docx = mp.pandoc_markdown_to_docx(md_tr, reference_docx_bytes=(reference_docx_bytes or docx_bytes))
     latex = mp.pandoc_markdown_to_latex(md_tr)
     return md_tr, out_docx, latex, stats
 
@@ -2654,6 +2677,17 @@ with tabs[2]:
     enable_pandoc_translate = st.checkbox("启用 Pandoc 中转翻译（更稳，推荐）", value=True, key="pandoc_translate_enable")
     max_batch_chars2 = st.number_input("每批最大字符数（自动分段）", min_value=2000, max_value=20000, value=8000, step=500, key="pandoc_translate_max_chars")
 
+
+    with st.expander("格式保真增强（语义分块 / reference.docx / 参考文献策略）", expanded=False):
+        st.caption("以下选项均为增量增强；不影响你原有功能与默认流程。")
+        split_strategy = st.selectbox(
+            "分块策略（影响翻译分段稳定性）",
+            ["Pandoc AST 语义分块（推荐）", "字符分块（旧，兼容）"],
+            index=0,
+            key="pandoc_translate_split_strategy",
+        )
+        skip_references = st.checkbox("参考文献块不翻译（References/Bibliography/参考文献）", value=False, key="pandoc_translate_skip_references")
+        ref_docx = st.file_uploader("（可选）上传 reference.docx 用于统一导出样式", type=["docx"], key="pandoc_translate_reference_docx")
     with st.expander("智能术语提取（Smart Glossary Extraction）", expanded=False):
         st.caption("翻译前可先预扫描文档前部内容，自动提取 top-K 术语候选，勾选后写入术语表。")
         csg1, csg2 = st.columns(2)
@@ -2717,6 +2751,7 @@ with tabs[2]:
         try:
             doc_bytes2 = read_uploaded_bytes(docx_file)
             sha2 = mp.sha256_bytes(doc_bytes2)
+            ref_bytes2 = read_uploaded_bytes(ref_docx) if 'ref_docx' in locals() and ref_docx else None
             with st.spinner("Pandoc 中转翻译中（会自动缓存，重复操作不重复付费）..."):
                 md_tr, out_docx_tr, latex_tr, stats = _cached_pandoc_translate_ocr_route(
                     sha2,
@@ -2727,6 +2762,7 @@ with tabs[2]:
                     max_batch_chars=int(max_batch_chars2),
                     glossary_text=st.session_state.get("glossary_text", ""),
                     glossary_allow_substring=bool(st.session_state.get("glossary_allow_substring", False)),
+                    reference_docx_bytes=ref_bytes2,
                 )
 
             st.success("Pandoc 翻译完成")
@@ -3106,27 +3142,67 @@ with tabs[4]:
 
     docx_title_file = st.file_uploader("上传 Word 文档（.docx）", type=["docx"], key="docx_title_format")
 
-    col_t1, col_t2, col_t3 = st.columns(3)
-    with col_t1:
-        st.markdown("**一级标题样式**")
-        h1_font = st.text_input("字体名（H1）", value="SimHei", key="h1_font")
-        h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h1_size")
-        h1_bold = st.checkbox("加粗（H1）", value=True, key="h1_bold")
-    with col_t2:
-        st.markdown("**二级标题样式**")
-        h2_font = st.text_input("字体名（H2）", value="SimHei", key="h2_font")
-        h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h2_size")
-        h2_bold = st.checkbox("加粗（H2）", value=True, key="h2_bold")
-    with col_t3:
-        st.markdown("**三级标题样式**")
-        h3_font = st.text_input("字体名（H3）", value="SimHei", key="h3_font")
-        h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=12.0, step=0.5, key="h3_size")
-        h3_bold = st.checkbox("加粗（H3）", value=True, key="h3_bold")
+    
+
+col_t1, col_t2, col_t3 = st.columns(3)
+with col_t1:
+    st.markdown("**一级标题样式**")
+    h1_font = ui_font_picker("字体（H1）", key_prefix="h1_font", default="SimHei")
+    h1_size = st.number_input("字号 pt（H1）", min_value=8.0, max_value=72.0, value=16.0, step=0.5, key="h1_size")
+    h1_bold = st.checkbox("加粗（H1）", value=True, key="h1_bold")
+with col_t2:
+    st.markdown("**二级标题样式**")
+    h2_font = ui_font_picker("字体（H2）", key_prefix="h2_font", default="SimHei")
+    h2_size = st.number_input("字号 pt（H2）", min_value=8.0, max_value=72.0, value=14.0, step=0.5, key="h2_size")
+    h2_bold = st.checkbox("加粗（H2）", value=True, key="h2_bold")
+with col_t3:
+    st.markdown("**三级标题样式**")
+    h3_font = ui_font_picker("字体（H3）", key_prefix="h3_font", default="SimHei")
+    h3_size = st.number_input("字号 pt（H3）", min_value=8.0, max_value=72.0, value=12.0, step=0.5, key="h3_size")
+    h3_bold = st.checkbox("加粗（H3）", value=True, key="h3_bold")
+
+with st.expander("扩展应用范围（可选）", expanded=False):
+    st.caption("不改变原有标题样式处理逻辑；仅在勾选后，额外把同一套字体规则应用到正文/表格/题注。")
+    cA, cB, cC = st.columns(3)
+
+    with cA:
+        apply_to_body = st.checkbox("应用到正文（Normal）", value=False, key="apply_to_body")
+        body_font = ui_font_picker("字体（正文）", key_prefix="body_font", default="Times New Roman")
+        body_size = st.number_input("字号 pt（正文）", min_value=8.0, max_value=72.0, value=11.0, step=0.5, key="body_size")
+        body_bold = st.checkbox("加粗（正文）", value=False, key="body_bold")
+
+    with cB:
+        apply_to_tables = st.checkbox("应用到表格", value=False, key="apply_to_tables")
+        table_font = ui_font_picker("字体（表格）", key_prefix="table_font", default="Times New Roman")
+        table_size = st.number_input("字号 pt（表格）", min_value=8.0, max_value=72.0, value=10.5, step=0.5, key="table_size")
+        table_bold = st.checkbox("加粗（表格）", value=False, key="table_bold")
+
+    with cC:
+        apply_to_captions = st.checkbox("应用到题注/Caption", value=False, key="apply_to_captions")
+        caption_font = ui_font_picker("字体（题注）", key_prefix="caption_font", default="Times New Roman")
+        caption_size = st.number_input("字号 pt（题注）", min_value=8.0, max_value=72.0, value=10.5, step=0.5, key="caption_size")
+        caption_bold = st.checkbox("加粗（题注）", value=False, key="caption_bold")
 
     cfg = {
-        1: {"font_name": h1_font, "size_pt": float(h1_size), "bold": bool(h1_bold)},
-        2: {"font_name": h2_font, "size_pt": float(h2_size), "bold": bool(h2_bold)},
-        3: {"font_name": h3_font, "size_pt": float(h3_size), "bold": bool(h3_bold)},
+    1: {"font_name": h1_font, "size_pt": float(h1_size), "bold": bool(h1_bold)},
+    2: {"font_name": h2_font, "size_pt": float(h2_size), "bold": bool(h2_bold)},
+    3: {"font_name": h3_font, "size_pt": float(h3_size), "bold": bool(h3_bold)},
+    }
+
+    # Forward extra-scope params to backend (defaults keep original behavior)
+    extra_scope = {
+        "apply_to_body": bool(st.session_state.get("apply_to_body", False)),
+        "body_style": {"font_name": (st.session_state.get("body_font_custom") if st.session_state.get("body_font_sel") == FONT_PICKER_SENTINEL_CUSTOM else st.session_state.get("body_font_sel", "")),
+                       "size_pt": float(st.session_state.get("body_size", 11.0)),
+                       "bold": bool(st.session_state.get("body_bold", False))},
+        "apply_to_tables": bool(st.session_state.get("apply_to_tables", False)),
+        "table_style": {"font_name": (st.session_state.get("table_font_custom") if st.session_state.get("table_font_sel") == FONT_PICKER_SENTINEL_CUSTOM else st.session_state.get("table_font_sel", "")),
+                        "size_pt": float(st.session_state.get("table_size", 10.5)),
+                        "bold": bool(st.session_state.get("table_bold", False))},
+        "apply_to_captions": bool(st.session_state.get("apply_to_captions", False)),
+        "caption_style": {"font_name": (st.session_state.get("caption_font_custom") if st.session_state.get("caption_font_sel") == FONT_PICKER_SENTINEL_CUSTOM else st.session_state.get("caption_font_sel", "")),
+                          "size_pt": float(st.session_state.get("caption_size", 10.5)),
+                          "bold": bool(st.session_state.get("caption_bold", False))},
     }
 
     # ---- rule-based analyze ----
@@ -3223,7 +3299,7 @@ with tabs[4]:
     # ---- apply/export ----
     def _apply_title_formatting_with_ai(docx_bytes: bytes, cfg: dict, ai_suggest: dict) -> bytes:
         # First apply rule-based styling (preserves original behavior)
-        out1 = mp.apply_title_formatting_to_docx(docx_bytes, cfg)
+        out1 = mp.apply_title_formatting_to_docx(docx_bytes, cfg, **extra_scope)
 
         # If AI suggests more, apply run-level formatting to those paragraphs too.
         items = ai_suggest.get("items", []) if isinstance(ai_suggest, dict) else []
@@ -3265,7 +3341,7 @@ with tabs[4]:
             if ai_enable and ai_suggest.get("items"):
                 out_docx = _apply_title_formatting_with_ai(title_doc_bytes, cfg, ai_suggest)
             else:
-                out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg)
+                out_docx = mp.apply_title_formatting_to_docx(title_doc_bytes, cfg, **extra_scope)
             st.success("标题样式已应用并生成新文档。")
             st.download_button(
                 "下载：TitleFormatted.docx",
