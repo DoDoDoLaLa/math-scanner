@@ -209,6 +209,7 @@ from openai import OpenAI
 
 import httpx
 from docx import Document
+from docx.shared import Pt
 from docx.text.paragraph import Paragraph
 from docx.table import Table
 from docx.oxml import OxmlElement
